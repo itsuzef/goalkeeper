@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-26
+
+**The gk CLI: state mechanics move from prose to code.** Every state transition (activate, checkpoint, validate, verdict, chain advance, pause, resume, clear) is now executed by `scripts/gk.py` — a single dependency-free Python CLI — instead of being hand-performed by the model following ~2,000 lines of SKILL.md instructions. Skills carry judgment (what to do); gk carries mechanism (the writes). A new PreToolUse hook turns goalkeeper's hard rules into mechanical guarantees.
+
+### Why
+
+v0.1–v0.3 documented a state machine in prose and trusted the model to execute it faithfully across five skill files that "MUST conform" to canonical shapes documented in a sixth place. Every invariant — append-only log, contract immutability, cursor-advance-on-approve — was a request, not a guarantee, and the chain skill needed a whole "Recovery from interrupted advance" section because interruptions could leave hand-written state inconsistent. Moving the mechanics into one tested script eliminates shape drift by construction, makes judge briefs byte-for-byte reproducible, and cuts the tokens previously spent re-deriving mechanical procedures every invocation.
+
+### Added
+
+- `scripts/gk.py` — the goalkeeper state mechanic. Subcommands: `status`, `activate`, `baseline`, `checkpoint`, `validate`, `judge-brief`, `verdict`, `chain-start`, `advance`, `pause`, `resume`, `clear`, `log`, `doctor`, `hook-guard`. Stdlib-only, Python 3.9+. Atomic JSON writes (tmp + rename). Real UTC timestamps instead of model-written ones.
+- `hooks/hooks.json` — PreToolUse hook (Edit|Write|NotebookEdit) running `gk hook-guard`: blocks direct edits to the active goal's `contract.md`, `log.md`, `state.json`, and to `active.json` / `chain.json`, with a message pointing at the gk commands. Fails open when no goal is active, for `_archive/` and `shared/` paths, and on any parse error — it can never brick unrelated edits. Contract immutability and the append-only log are now enforced, not requested.
+- `gk verdict <slug> approve|reject` applies a judge's structured response from stdin: extracts REASONS/FIX_LIST verbatim into the log, handles the rejection threshold, and — when a chain is active — records the link approval and advances the cursor **atomically** (prints `DONE` / `NEXT: <slug>` / `CHAIN_COMPLETE` / `RETRY` / `NEEDS_HUMAN` for the orchestrating skill).
+- `gk judge-brief <slug> [--executor-summary <file>]` — deterministic judge-prompt assembly: contract verbatim, compacted log, baseline/dirty-path subtraction, deduped file list, exclusion-filtered diff (capped at 150KB with a truncation note), and the verdict-format block. Replaces the six-step manual assembly procedure in `goal-judge/SKILL.md`.
+- `gk doctor [--fix]` — detects and repairs the interrupted-advance failure shapes (stale active.json, missing next-link state, approved-but-not-advanced cursor, missing link_approvals). Replaces the Symptoms A–D recovery prose.
+- `gk log <slug> --compact` — activation entry + every judge/lifecycle block + last N checkpoints, with an omission marker. Used for executor re-spawns, judge briefs, and supervisor input, so spawn prompts no longer grow monotonically with the log.
+- `gk baseline <slug>` — pre-activation validator run recorded to `baseline.json`; merged into `state.json` at activation (replaces prep's manual baseline capture).
+- `gk resume` from `needs_human` **requires** `--reset-rejections` or `--keep-count` — the CLI itself enforces that the user was asked.
+- `scripts/test-gk.py` — 82-assertion end-to-end suite driving gk as a subprocess through real lifecycles in throwaway git repos: standalone goal, max-rejections/needs_human gating, chain start→advance→complete, clear-aborts-chain, baseline merge, judge-brief content, log compaction, doctor repair, and hook-guard block/allow/fail-open behavior. Wired into CI.
+
+### Changed
+
+- All eight SKILL.md files rewritten or trimmed to delegate mechanics to gk. Net effect: skills describe judgment and orchestration; no skill hand-writes a state file or log entry anymore. The "Canonical state shapes" section moved out of `goal/SKILL.md` — `scripts/gk.py` is now the single source of truth for shapes (asserted by both test suites).
+- Judge hardening: every MET verdict in the judge's REASONS must now cite `file:line` (or a named file section) as evidence — a MET without a citation is invalid. `goal-judge/SKILL.md` also documents an optional **multi-lens panel** for high-stakes gates (placeholder-hunter / non-goals auditor / behavior verifier run in parallel; approve only if all approve).
+- Executor-subagent directive (`goal-chain/SKILL.md`) now instructs executors to checkpoint and validate via gk — required, since the hook would block their direct log edits.
+- Removed the stale "Cache-aware wakeup delay" section (written against the old 5-minute prompt-cache TTL, which no longer holds). Pacing now defers to the contract's `wakeup_seconds` and the harness's own live ScheduleWakeup guidance.
+
+### Removed
+
+- `goal-chain/SKILL.md` "Advance mode" and "Recovery from interrupted advance" sections — superseded by `gk verdict`'s atomic advance and `gk doctor`.
+
+### Migration notes
+
+- **State-file compatible.** gk reads and writes the same `state.json` / `active.json` / `chain.json` / `log.md` shapes as v0.3; an in-flight v0.3 goal or chain continues under v0.4 (run `gk doctor` once if it was interrupted mid-advance).
+- **Contracts unchanged.** All existing contract.md files remain valid; the schema is untouched.
+- **Hook activation requires a plugin reload** (disable/enable or restart) — hooks are read at startup.
+
 ## [0.3.0] - 2026-05-11
 
 **Executor-subagent chain execution.** Chains now run each goal's implementation work in a fresh-context subagent instead of the main conversation. Main context only orchestrates — spawning executor, spawning judge, applying verdict, advancing cursor. This is the load-bearing change that lets multi-goal chains run autonomously without main-context aging out.

@@ -157,7 +157,7 @@ Schema: [`schemas/contract.schema.json`](./schemas/contract.schema.json).
 - **checkpoint_cadence** — agent's guidance for how often to log + validate.
 - **max_rejections** — default 5. After this many judge rejections, pauses for human.
 - **judge_mode** — `subagent` (default, gate-quality) or `inline` (cheap, advisory only).
-- **wakeup_seconds** — between-iteration delay. Tune to validator runtime; goalkeeper picks cache-aware default if unset.
+- **wakeup_seconds** — between-iteration delay. Tune to validator runtime; if unset, the model picks per the harness's ScheduleWakeup guidance.
 - **diff_excludes** — additional pathspec globs the judge should ignore. Appended to defaults (lockfiles, `dist/`, `build/`, `coverage/`, IDE files). Add per-repo noise like generated migrations or vendor trees.
 
 ## Chains
@@ -292,9 +292,18 @@ Missions are NOT chains. Chains commit to a pre-determined linear sequence; miss
 
 By default everything under `.claude/goals/` is gitignored. To share a contract with your team, place it under `.claude/goals/shared/<slug>/contract.md`. The mission files (`mission.md`/`mission.json`/`mission-log.md`) live at `.claude/` root and are NOT auto-gitignored — author your mission charter the way you want it tracked.
 
+### The gk CLI — mechanism lives in code, not prose (v0.4)
+
+Every state transition — activate, checkpoint, validate, judge verdict, chain advance, pause, resume, clear — is executed by [`scripts/gk.py`](./scripts/gk.py), a dependency-free Python CLI. The skills carry judgment (what to do next, what to ask the user, what to put in a prompt); gk carries mechanism (every write to the files below). This is what makes the shapes drift-proof: there is exactly one implementation, exercised end-to-end by [`scripts/test-gk.py`](./scripts/test-gk.py).
+
+Two consequences worth knowing as a user:
+
+- **The hard rules are enforced, not requested.** A PreToolUse hook ([`hooks/hooks.json`](./hooks/hooks.json)) blocks the model from directly editing an active goal's `contract.md`, `log.md`, or `state.json` — contract immutability and the append-only audit trail are mechanical guarantees. The hook fails open: with no active goal it allows everything.
+- **Recovery is a command.** If a session dies mid-chain-advance, `gk doctor --fix` detects and repairs the inconsistency (stale pointers, missing state, un-advanced cursors). You can also run `gk status` yourself in any terminal for an instant read on the active goal.
+
 ### Canonical state shapes
 
-The skills (`goal`, `goal-clear`, `goal-judge`, `goal-chain`) all read and write the same shapes. Single source of truth lives in [`skills/goal/SKILL.md`](./skills/goal/SKILL.md) under "Canonical state shapes"; the reference here is for users.
+All skills read and write the same shapes via gk. Single source of truth is `scripts/gk.py` (asserted by both test suites); the reference here is for users.
 
 **`active.json`** — exactly two shapes, active or terminal:
 
@@ -322,7 +331,8 @@ The skills (`goal`, `goal-clear`, `goal-judge`, `goal-chain`) all read and write
 - **Judge ≠ validator.** Validators check that things work; the judge checks that the *right* things work. Validator passing is necessary but not sufficient.
 - **Subagent judge is the gate.** Independent context catches the placeholders and shortcuts the executing agent rationalized away. Inline judge mode exists for cheap advisory review only — do not use it as a gate.
 - **Append-only log.** Logs are forensic artifacts. Past entries are never deleted or rewritten.
-- **Cache-aware wakeup delays.** Anthropic's prompt cache has a 5-minute TTL. goalkeeper picks delays that either stay warm (60–270s) or commit to long waits (1200s+) — never the worst-of-both 300s.
+- **Skills decide, gk writes.** (v0.4) Prose-as-runtime was goalkeeper's original architecture and its biggest liability: every invariant depended on the model faithfully hand-executing a state machine described across five skill files. Moving the mechanics into one tested CLI makes verdicts reproducible (judge briefs are assembled byte-for-byte identically), makes interruptions recoverable (`gk doctor`), and turns the hard rules into hook-enforced guarantees.
+- **Wakeup pacing defers to the harness.** Set `wakeup_seconds` in the contract to pin a delay; otherwise the model follows the harness's live ScheduleWakeup guidance rather than goalkeeper second-guessing prompt-cache behavior that changes across versions.
 - **Anti-placeholder.** Borrowed verbatim from Ralph: stubs, mocks, `.todo`, `.skip`, and "TODO: real implementation" are automatic judge rejection.
 
 ## Prior art
