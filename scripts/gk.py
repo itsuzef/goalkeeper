@@ -29,6 +29,7 @@ Usage:
   gk mission-status
   gk mission-brief
   gk mission-verdict proceed|done|escalate       (supervisor's structured response on stdin)
+  gk mission-resume [--note TEXT]                (escalated → active, after the user resolves)
   gk hook-guard                                  (PreToolUse JSON on stdin)
 """
 
@@ -1074,7 +1075,9 @@ def _goal_in_flight(goals: Path) -> Optional[str]:
 
 
 def cmd_mission_init(args) -> int:
-    goals = find_goals_dir()
+    # create=True: a mission legitimately starts before any goal has ever
+    # been activated, so .claude/goals/ may not exist yet.
+    goals = find_goals_dir(create=True)
     charter = mission_charter(goals)
     if charter is None:
         die(f"no mission charter at {claude_dir(goals) / 'mission.md'}. "
@@ -1241,7 +1244,11 @@ def cmd_mission_verdict(args) -> int:
     prior_slug = prior["slug"] if prior else None
 
     verdicts = mission.setdefault("supervisor_verdicts", [])
-    if verdicts and verdicts[-1].get("prior_slug") == prior_slug:
+    # One invocation per goal-completion — except a resolved escalation:
+    # after mission-resume, the supervisor legitimately re-runs against the
+    # same prior goal (the status gate above blocks un-resumed escalations).
+    if verdicts and verdicts[-1].get("prior_slug") == prior_slug \
+            and verdicts[-1].get("verdict") != "escalate":
         die(f"a supervisor verdict for prior goal '{prior_slug}' is already "
             f"recorded ({verdicts[-1].get('verdict')} at "
             f"{verdicts[-1].get('at')}). One invocation per goal-completion — "
@@ -1317,6 +1324,26 @@ def cmd_mission_verdict(args) -> int:
     else:
         print("ESCALATE")
         print(entry["escalation"])
+    return 0
+
+
+def cmd_mission_resume(args) -> int:
+    """Escalated → active: the user has provided the required input."""
+    goals = find_goals_dir()
+    mission = read_mission(goals)
+    if mission is None:
+        die("mission not initialized — run gk mission-init")
+    if mission.get("status") != "escalated":
+        die(f"mission status is '{mission.get('status')}' — mission-resume "
+            "only applies to an escalated mission.")
+    mission["status"] = "active"
+    write_mission(goals, mission)
+    note = (args.note or "").strip()
+    append_mission_log(goals, "escalation resolved",
+                       "Resumed by user."
+                       + (f"\nResolution: {note}" if note else ""))
+    print(f"Mission '{mission.get('name')}' resumed (escalation resolved). "
+          "Re-run the supervisor: gk mission-brief → spawn → gk mission-verdict.")
     return 0
 
 
@@ -1483,6 +1510,10 @@ def main() -> int:
     sp = sub.add_parser("mission-verdict")
     sp.add_argument("decision", choices=["proceed", "done", "escalate"])
     sp.set_defaults(fn=cmd_mission_verdict)
+
+    sp = sub.add_parser("mission-resume")
+    sp.add_argument("--note")
+    sp.set_defaults(fn=cmd_mission_resume)
 
     sp = sub.add_parser("hook-guard")
     sp.set_defaults(fn=cmd_hook_guard)

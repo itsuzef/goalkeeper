@@ -65,7 +65,15 @@ success condition — equivalent to a contract's non_goals at the mission level.
 gk mission-init
 ```
 
-gk refuses without a charter at `.claude/mission.md`, refuses while a goal is in flight, initializes `mission.json` + the mission log on first run, and no-ops if the mission already exists. Relay any refusal to the user verbatim.
+gk refuses without a charter at `.claude/mission.md`, refuses while a goal is in flight, initializes `mission.json` + the mission log on first run (creating `.claude/goals/` if this is the project's first goalkeeper use), and no-ops if the mission already exists. Relay any refusal to the user verbatim.
+
+**If `gk mission-status` shows the mission is `escalated`** and the user is re-invoking the supervisor after addressing the required input, run
+
+```
+gk mission-resume --note "<how the user resolved the escalation>"
+```
+
+first — it flips the mission back to active and logs the resolution; without it, gk refuses further verdicts. Re-invoking `/goal-supervisor` after an escalation is the user's signal that they resolved it, but if their message doesn't say how, ask before resuming rather than inventing a resolution note.
 
 ### Step 2 — assemble the brief
 
@@ -93,7 +101,7 @@ Then act on what it printed:
 
 - **`PROCEED`** — hand the printed NEXT_OBJECTIVE to `/goalkeeper:goal-prep` as the rough idea. The user reviews and approves/edits the drafted contract per the standard prep flow. **Do NOT auto-activate** — the user-review checkpoint at prep is the human-in-the-loop safety property and is mandatory. "PROCEED" means "propose and draft", never "activate". Tell the user: "Supervisor verdict: PROCEED. Drafting next goal: `<objective>`. Review the contract before activating."
 - **`DONE`** — tell the user: "Supervisor verdict: DONE. Mission `<name>` complete. See `.claude/mission-completed.md` for the final snapshot."
-- **`ESCALATE`** — tell the user: "Supervisor cannot decide. Required input: <printed escalation, verbatim>. Resolve the question and run `/goalkeeper:goal-supervisor` again, or `/goalkeeper:goal-prep` a specific next goal yourself."
+- **`ESCALATE`** — tell the user: "Supervisor cannot decide. Required input: <printed escalation, verbatim>. Resolve the question and run `/goalkeeper:goal-supervisor` again (it resumes the mission via `gk mission-resume` and re-runs the verdict against the same prior goal), or `/goalkeeper:goal-prep` a specific next goal yourself."
 
 ## Hard rules
 

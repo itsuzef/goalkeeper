@@ -490,17 +490,65 @@ def test_mission_lifecycle(tmp: Path, v: bool) -> Test:
     return t
 
 
-def test_mission_escalate_and_guards(tmp: Path, v: bool) -> Test:
-    t = Test("mission: escalate path + verdict section requirements", v)
+def test_mission_fresh_init(tmp: Path, v: bool) -> Test:
+    t = Test("mission: init on a fresh project (no .claude/goals yet)", v)
+    proj = tmp / "mission-fresh"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "mission.md").write_text(MISSION_MD)
+    r = gk(proj, "mission-init")
+    t.check("init succeeds without pre-existing .claude/goals",
+            r.returncode == 0)
+    goals = proj / ".claude" / "goals"
+    t.check(".claude/goals created", goals.is_dir())
+    t.check("goals .gitignore seeded", (goals / ".gitignore").is_file())
+    mission = read_json(proj / ".claude" / "mission.json")
+    t.check("mission.json initialized",
+            mission is not None and mission["status"] == "active")
+    r = gk(proj, "mission-brief")
+    t.check("brief works on the fresh mission (first-invocation framing)",
+            r.returncode == 0 and "first supervisor invocation" in r.stdout)
+    return t
+
+
+def test_mission_escalate_and_recovery(tmp: Path, v: bool) -> Test:
+    t = Test("mission: escalate → resume → re-verdict on same prior goal", v)
     proj = make_mission_project(tmp, "mission-esc")
+    claude = proj / ".claude"
     gk(proj, "mission-init")
     r = gk(proj, "mission-verdict", "proceed", stdin="VERDICT: proceed\n")
     t.check("proceed without NEXT_OBJECTIVE refused", r.returncode != 0)
+    r = gk(proj, "mission-resume")
+    t.check("resume refused while mission active", r.returncode != 0)
+
     r = gk(proj, "mission-verdict", "escalate", stdin=ESCALATE_RESPONSE)
     t.check("escalate prints ESCALATE + required input",
             "ESCALATE" in r.stdout and "conversion-rate" in r.stdout)
-    mission = read_json(proj / ".claude" / "mission.json")
+    mission = read_json(claude / "mission.json")
     t.check("mission status escalated", mission["status"] == "escalated")
+
+    r = gk(proj, "mission-verdict", "proceed", stdin=PROCEED_RESPONSE)
+    t.check("verdict refused while escalated (un-resumed)", r.returncode != 0)
+    r = gk(proj, "mission-brief")
+    t.check("brief still works while escalated", r.returncode == 0)
+
+    r = gk(proj, "mission-resume", "--note", "defined conversion-rate in charter")
+    t.check("mission-resume exits 0", r.returncode == 0)
+    mission = read_json(claude / "mission.json")
+    t.check("status back to active", mission["status"] == "active")
+    log = (claude / "mission-log.md").read_text()
+    t.check("resolution logged with note",
+            "escalation resolved" in log and "defined conversion-rate" in log)
+
+    r = gk(proj, "mission-verdict", "proceed", stdin=PROCEED_RESPONSE)
+    t.check("same-prior-goal verdict accepted after resolved escalation",
+            r.returncode == 0 and "PROCEED" in r.stdout)
+    mission = read_json(claude / "mission.json")
+    t.check("both verdicts on record (escalate then proceed)",
+            [x["verdict"] for x in mission["supervisor_verdicts"]]
+            == ["escalate", "proceed"])
+    r = gk(proj, "mission-verdict", "proceed", stdin=PROCEED_RESPONSE)
+    t.check("one-per-goal-completion guard still holds after proceed",
+            r.returncode != 0)
     return t
 
 
@@ -588,7 +636,8 @@ def main() -> int:
         test_doctor,
         test_hook_guard,
         test_mission_lifecycle,
-        test_mission_escalate_and_guards,
+        test_mission_fresh_init,
+        test_mission_escalate_and_recovery,
         test_mission_hook_guard,
     ]
     total_pass = total_fail = 0

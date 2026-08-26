@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-26
+
+Two mission-layer bugs (user-found), plus a third latent one behind the second:
+
+### Fixed
+
+- **Fresh mission initialization failed unless `.claude/goals/` already existed.** `gk mission-init` now calls `find_goals_dir(create=True)` — a mission legitimately starts before any goal has ever been activated, and init now seeds the goals dir (with its `.gitignore`) on a first-time project.
+- **Escalated missions could not resume.** `mission-brief` worked after escalation, but every subsequent verdict was refused because status stayed `escalated`. New `gk mission-resume [--note TEXT]` performs the explicit escalated → active transition, logging the user's resolution; the supervisor skill runs it when re-invoked after an escalation.
+- **The one-invocation-per-goal-completion guard also blocked the post-escalation re-run** (same prior goal → refused), which would have made `mission-resume` insufficient on its own. The guard now exempts a resolved escalation; un-resumed escalations are still blocked by the status gate, and the guard still refuses after a proceed/done.
+
+### Testing
+
+The original tests missed all three because fixtures pre-created `.claude/goals` and the escalation test only verified *entering* escalation. Added `test_mission_fresh_init` (no pre-existing goals dir) and rewrote the escalation test as a full recovery arc: escalate → verdict-refused → resume with note → same-prior-goal verdict accepted → guard still holds after proceed. 128 assertions total.
+
 ## [0.5.0] - 2026-08-26
 
 **The mission layer gets the gk treatment.** The supervisor was the last tier whose state files were hand-written by prose; its mechanics now run through gk, its state files are hook-protected, and the layer finally has end-to-end tests.
