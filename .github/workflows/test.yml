@@ -28,6 +28,9 @@ jobs:
       - name: Run the lifecycle state-machine suite
         run: python3 scripts/test-lifecycle.py
 
+      - name: Run the gk end-to-end suite
+        run: python3 scripts/test-gk.py
+
       - name: Lint plugin manifest JSON
         run: |
           python3 -c "import json; json.load(open('.claude-plugin/plugin.json'))"

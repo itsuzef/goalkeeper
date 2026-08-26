@@ -6,10 +6,10 @@ constructs the canonical state shapes per the spec, and asserts that
 every transition produces the expected shape. Runs in seconds.
 
 This is a *spec consistency* test, not a Claude Code skill integration
-test — it codifies the canonical state shapes from skills/goal/SKILL.md
-"Canonical state shapes" and verifies that constructing them per spec
-produces the right thing. If a skill SKILL.md drifts from these shapes,
-update both the spec and this test together.
+test — it codifies the canonical state shapes (owned since v0.4 by
+scripts/gk.py, the single implementation of every state transition) and
+verifies that constructing them per spec produces the right thing. If a
+shape changes in gk.py, update this test and scripts/test-gk.py together.
 
 Usage:
   python3 scripts/test-lifecycle.py [--keep] [-v]

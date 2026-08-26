@@ -1,0 +1,16 @@
+{
+  "description": "Goalkeeper invariant enforcement: blocks direct Edit/Write to an active goal's contract.md, log.md, state.json, and to active.json/chain.json — those files are managed exclusively by the gk CLI so the audit trail and contract immutability are guarantees, not requests. Fails open: allows everything when no goal is active or on any parse error.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/gk.py\" hook-guard"
+          }
+        ]
+      }
+    ]
+  }
+}
