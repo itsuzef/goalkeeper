@@ -25,6 +25,10 @@ Usage:
   gk clear --yes
   gk log <slug> [--compact] [--checkpoints N]
   gk doctor [--fix]
+  gk mission-init
+  gk mission-status
+  gk mission-brief
+  gk mission-verdict proceed|done|escalate       (supervisor's structured response on stdin)
   gk hook-guard                                  (PreToolUse JSON on stdin)
 """
 
@@ -334,14 +338,19 @@ def cmd_status(args) -> int:
     goals = find_goals_dir()
     slug = active_info(goals)
     chain = read_json(goals / "chain.json")
+    mission = read_mission(goals)
     if args.json:
         payload = {
             "active": read_json(goals / "active.json"),
             "state": load_state(goals, slug) if slug else None,
             "chain": chain,
+            "mission": mission,
         }
         print(json.dumps(payload, indent=2))
         return 0
+    if mission:
+        print(f"Mission:     {mission.get('name')}  ({mission.get('status')}, "
+              f"{len(mission.get('goals_completed', []))} goals completed)")
     if not slug:
         term = read_json(goals / "active.json") or {}
         prev = term.get("previous_slug")
@@ -972,6 +981,346 @@ def cmd_doctor(args) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mission layer (supervisor state)
+# ─────────────────────────────────────────────────────────────────────────────
+
+MISSION_FILES = ("mission.json", "mission-log.md", "mission-completed.md")
+
+
+def claude_dir(goals: Path) -> Path:
+    return goals.parent
+
+
+def read_mission(goals: Path) -> Optional[dict]:
+    return read_json(claude_dir(goals) / "mission.json")
+
+
+def write_mission(goals: Path, mission: dict) -> None:
+    write_json(claude_dir(goals) / "mission.json", mission)
+
+
+def mission_charter(goals: Path) -> Optional[str]:
+    path = claude_dir(goals) / "mission.md"
+    return path.read_text() if path.is_file() else None
+
+
+def mission_name_from_md(text: str) -> str:
+    for line in text.splitlines():
+        m = re.match(r"^#\s+(?:Mission:\s*)?(.+)$", line.strip())
+        if m:
+            return m.group(1).strip()
+    return "unnamed-mission"
+
+
+def append_mission_log(goals: Path, title: str, body: str) -> None:
+    log = claude_dir(goals) / "mission-log.md"
+    entry = f"\n## {now_iso()} — {title}\n"
+    if body.strip():
+        entry += body.rstrip() + "\n"
+    with log.open("a") as f:
+        f.write(entry)
+
+
+def locate_prior_goal(goals: Path) -> Optional[dict]:
+    """Most-recently-ended goal: {slug, dir, state, log_text} or None."""
+    def bundle(slug: str, d: Path) -> Optional[dict]:
+        state = read_json(d / "state.json")
+        if state is None:
+            return None
+        log_path = d / "log.md"
+        return {"slug": slug, "dir": d, "state": state,
+                "log_text": log_path.read_text() if log_path.is_file() else ""}
+
+    active = read_json(goals / "active.json") or {}
+    prev = active.get("previous_slug")
+    if prev:
+        if (goals / prev).is_dir():
+            b = bundle(prev, goals / prev)
+            if b:
+                return b
+        arch = sorted((goals / "_archive").glob(f"{prev}-*")) \
+            if (goals / "_archive").is_dir() else []
+        if arch:
+            b = bundle(prev, arch[-1])
+            if b:
+                return b
+    arch_dirs = sorted(d for d in (goals / "_archive").iterdir() if d.is_dir()) \
+        if (goals / "_archive").is_dir() else []
+    if arch_dirs:
+        d = arch_dirs[-1]
+        slug = re.sub(r"-\d{8}-\d{6}$", "", d.name)
+        b = bundle(slug, d)
+        if b:
+            return b
+    done = []
+    for d in goals.iterdir():
+        if d.is_dir() and d.name not in ("_archive", "shared"):
+            st = read_json(d / "state.json")
+            if st and st.get("status") == "done":
+                done.append((st.get("approved_at") or st.get("started_at") or "", d))
+    if done:
+        d = max(done)[1]
+        return bundle(d.name, d)
+    return None
+
+
+def _goal_in_flight(goals: Path) -> Optional[str]:
+    """Slug of a goal whose status blocks the supervisor, else None."""
+    slug = active_info(goals)
+    if not slug:
+        return None
+    st = load_state(goals, slug) or {}
+    return slug if st.get("status") in ("active", "paused", "needs_human") else None
+
+
+def cmd_mission_init(args) -> int:
+    goals = find_goals_dir()
+    charter = mission_charter(goals)
+    if charter is None:
+        die(f"no mission charter at {claude_dir(goals) / 'mission.md'}. "
+            "The supervisor requires a user-authored charter — it does not "
+            "auto-draft missions.")
+    blocking = _goal_in_flight(goals)
+    if blocking:
+        die(f"goal '{blocking}' is in flight — supervisor layer refuses while "
+            "a goal is active/paused/needs_human.")
+    mission = read_mission(goals)
+    if mission:
+        print(f"Mission '{mission.get('name')}' already initialized "
+              f"(status: {mission.get('status')}).")
+        return 0
+    mission = {
+        "name": mission_name_from_md(charter),
+        "status": "active",
+        "started_at": now_iso(),
+        "goals_completed": [],
+        "supervisor_verdicts": [],
+    }
+    write_mission(goals, mission)
+    append_mission_log(goals, "mission initialized",
+                       f"Mission: {mission['name']}")
+    print(f"Mission '{mission['name']}' initialized.")
+    return 0
+
+
+def cmd_mission_status(args) -> int:
+    goals = find_goals_dir()
+    mission = read_mission(goals)
+    if not mission:
+        print("No mission. Author .claude/mission.md, then run gk mission-init.")
+        return 0
+    print(f"Mission:     {mission.get('name')}")
+    print(f"Status:      {mission.get('status')}")
+    print(f"Started:     {mission.get('started_at')}")
+    done = mission.get("goals_completed", [])
+    print(f"Goals done:  {len(done)}"
+          + (f"  ({', '.join(g['slug'] for g in done)})" if done else ""))
+    verdicts = mission.get("supervisor_verdicts", [])
+    if verdicts:
+        last = verdicts[-1]
+        print(f"Last verdict: {last.get('verdict')} "
+              f"(prior goal: {last.get('prior_slug')}, at {last.get('at')})")
+    return 0
+
+
+SUPERVISOR_TASK = """\
+# Your task
+
+You are the mission supervisor. The user's mission is described above.
+One goal has just completed (or the mission is just starting). Your job:
+decide what happens next.
+
+You have three legal outputs:
+
+PROCEED — the mission is still active and the next goal can be named.
+  Output a one-sentence objective for the next goal. Reference what the
+  prior goal produced and how it shapes this one. The objective will be
+  fed to /goalkeeper:goal-prep, which drafts a full contract for USER
+  REVIEW — proceed never activates anything by itself.
+
+DONE — the mission's success condition is satisfied. Cite the specific
+  evidence in the prior goal(s) that demonstrates each part of the
+  success condition.
+
+ESCALATE — you cannot decide. Either the prior goal's output is
+  ambiguous, the mission charter is internally inconsistent, the
+  success condition isn't observable from the artifacts, or you've
+  hit a constraint that requires human judgment. Explain in 3-5
+  sentences exactly what decision needs human input.
+
+Escalate rather than proceed when: the prior goal ended in needs_human;
+the prior goal touched files the charter's Constraints mark off-limits;
+the success condition references a metric no goal has produced evidence
+for; or no shape in the charter's "Legal next-goal shapes" fits what is
+needed next.
+
+Output ONCE. Pre-think before writing. Do not self-correct mid-response.
+
+Respond in this exact format:
+
+VERDICT: proceed
+or
+VERDICT: done
+or
+VERDICT: escalate
+
+REASONING:
+<3-8 sentences explaining what the prior goal produced, what it tells
+you about mission progress, and why this verdict>
+
+NEXT_OBJECTIVE: (only if proceed — single sentence, will be passed to /goal-prep)
+
+DONE_EVIDENCE: (only if done — bulleted list of mission success-condition
+items, each with the specific prior-goal artifact that satisfies it)
+
+ESCALATION: (only if escalate — exactly what human input is needed and why)
+"""
+
+
+def cmd_mission_brief(args) -> int:
+    goals = find_goals_dir()
+    charter = mission_charter(goals)
+    if charter is None:
+        die("no .claude/mission.md — run gk mission-init guidance first")
+    mission = read_mission(goals)
+    if mission is None:
+        die("mission not initialized — run gk mission-init")
+    blocking = _goal_in_flight(goals)
+    if blocking:
+        die(f"goal '{blocking}' is in flight — supervisor refuses.")
+    root = project_root(goals)
+    prior = locate_prior_goal(goals)
+
+    out = []
+    out.append("You are the mission supervisor for a goalkeeper mission. "
+               "Fresh context — you have not seen any executing agent's "
+               "reasoning. Review the artifacts only.\n")
+    out.append("# Mission charter (user-authored — verbatim)\n")
+    out.append(charter)
+    out.append("\n# Mission progress\n")
+    out.append(json.dumps({
+        "goals_completed": mission.get("goals_completed", []),
+        "prior_verdicts": mission.get("supervisor_verdicts", []),
+    }, indent=2))
+    if prior:
+        out.append(f"\n# Prior goal: {prior['slug']}\n")
+        out.append("## state.json\n")
+        out.append(json.dumps(prior["state"], indent=2))
+        out.append("\n## Progress log (compacted)\n")
+        out.append(compact_log(prior["log_text"]) if prior["log_text"]
+                   else "(no log)")
+    else:
+        out.append("\n# Prior goal\n")
+        out.append("None — this is the mission's first supervisor invocation. "
+                   "Propose the first goal from the charter's "
+                   "\"Legal next-goal shapes\" section.")
+    head = _git(root, "rev-parse", "HEAD")
+    porcelain = _git(root, "status", "--porcelain") or ""
+    out.append("\n# Repo state\n")
+    out.append(f"HEAD: {(head or 'no-git').strip()[:9]}")
+    dirty_lines = porcelain.splitlines()[:20]
+    out.append("Dirty paths (first 20):\n" +
+               ("\n".join(dirty_lines) if dirty_lines else "(clean)"))
+    out.append("")
+    out.append(SUPERVISOR_TASK)
+    print("\n".join(out))
+    return 0
+
+
+def cmd_mission_verdict(args) -> int:
+    goals = find_goals_dir()
+    mission = read_mission(goals)
+    if mission is None:
+        die("mission not initialized — run gk mission-init")
+    if mission.get("status") != "active":
+        die(f"mission status is '{mission.get('status')}' — verdicts only "
+            "apply to an active mission.")
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    reasoning = _extract_section(raw, "REASONING") or "(none provided)"
+    prior = locate_prior_goal(goals)
+    prior_slug = prior["slug"] if prior else None
+
+    verdicts = mission.setdefault("supervisor_verdicts", [])
+    if verdicts and verdicts[-1].get("prior_slug") == prior_slug:
+        die(f"a supervisor verdict for prior goal '{prior_slug}' is already "
+            f"recorded ({verdicts[-1].get('verdict')} at "
+            f"{verdicts[-1].get('at')}). One invocation per goal-completion — "
+            "complete another goal first.")
+
+    entry = {"at": now_iso(), "prior_slug": prior_slug, "verdict": args.decision}
+
+    if args.decision == "proceed":
+        next_obj = _extract_section(raw, "NEXT_OBJECTIVE")
+        if not next_obj:
+            die("proceed verdict requires a NEXT_OBJECTIVE section on stdin")
+        entry["next_objective"] = next_obj
+        append_mission_log(goals, "supervisor verdict: proceed",
+                           f"Prior goal: {prior_slug or '(none — first invocation)'}\n"
+                           f"Reasoning: {reasoning}\n"
+                           f"Proposed next objective: {next_obj}")
+    elif args.decision == "done":
+        evidence = _extract_section(raw, "DONE_EVIDENCE")
+        if not evidence:
+            die("done verdict requires a DONE_EVIDENCE section on stdin")
+        append_mission_log(goals, "supervisor verdict: done",
+                           f"Mission: {mission.get('name')}\n"
+                           f"Reasoning: {reasoning}\nEvidence:\n{evidence}")
+        mission["status"] = "done"
+        mission["completed_at"] = now_iso()
+    else:  # escalate
+        escalation = _extract_section(raw, "ESCALATION")
+        if not escalation:
+            die("escalate verdict requires an ESCALATION section on stdin")
+        entry["escalation"] = escalation
+        append_mission_log(goals, "supervisor verdict: escalate",
+                           f"Prior goal: {prior_slug or '(none)'}\n"
+                           f"Reasoning: {reasoning}\n"
+                           f"Required input: {escalation}")
+        mission["status"] = "escalated"
+
+    if prior:
+        completed = mission.setdefault("goals_completed", [])
+        if not any(g.get("slug") == prior_slug for g in completed):
+            state = prior["state"]
+            completed.append({
+                "slug": prior_slug,
+                "result": "approved"
+                if state.get("last_judge_verdict") == "approve" else "cleared",
+                "rejection_count": state.get("rejection_count", 0),
+                "ended_at": state.get("approved_at") or now_iso(),
+            })
+        with (prior["dir"] / "log.md").open("a") as f:
+            f.write(f"\n## {now_iso()} — supervisor verdict\n"
+                    f"Mission `{mission.get('name')}` supervisor verdict on "
+                    f"this goal: {args.decision}.\n"
+                    f"See `.claude/mission-log.md` for full reasoning.\n")
+
+    verdicts.append(entry)
+    write_mission(goals, mission)
+
+    if args.decision == "done":
+        snapshot = (f"# Mission completed: {mission.get('name')}\n\n"
+                    f"Completed at: {mission['completed_at']}\n\n"
+                    f"## Final mission.json\n\n```json\n"
+                    f"{json.dumps(mission, indent=2)}\n```\n\n"
+                    f"## Supervisor reasoning\n\n{reasoning}\n\n"
+                    f"## Evidence\n\n"
+                    f"{_extract_section(raw, 'DONE_EVIDENCE')}\n\n"
+                    f"## Original charter (copy)\n\n{mission_charter(goals)}\n")
+        (claude_dir(goals) / "mission-completed.md").write_text(snapshot)
+        print("DONE")
+        print(f"Mission '{mission.get('name')}' complete. "
+              f"Snapshot: {claude_dir(goals) / 'mission-completed.md'}")
+    elif args.decision == "proceed":
+        print("PROCEED")
+        print(f"NEXT_OBJECTIVE: {entry['next_objective']}")
+    else:
+        print("ESCALATE")
+        print(entry["escalation"])
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # hook-guard — PreToolUse enforcement of goalkeeper invariants
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -991,6 +1340,29 @@ def cmd_hook_guard(_args) -> int:
         marker = f"{os.sep}.claude{os.sep}goals{os.sep}"
         idx = norm.find(marker)
         if idx == -1:
+            # Mission state files live at .claude/ root and are gk-managed
+            # while the mission is live (mission.md, the user's charter,
+            # is never blocked).
+            cmarker = f"{os.sep}.claude{os.sep}"
+            cidx = norm.find(cmarker)
+            if cidx == -1:
+                return 0
+            crel = norm[cidx + len(cmarker):]
+            if crel in MISSION_FILES:
+                mission = read_json(
+                    Path(norm[: cidx + len(cmarker)].rstrip(os.sep))
+                    / "mission.json") or {}
+                if mission.get("status") in ("active", "escalated"):
+                    print(
+                        f"goalkeeper hook-guard: '{crel}' belongs to the live "
+                        f"mission '{mission.get('name')}' and is managed by "
+                        f"the gk CLI — use `gk mission-init` / "
+                        f"`gk mission-verdict` (scripts/gk.py in the "
+                        f"goalkeeper plugin). The charter (mission.md) stays "
+                        f"user-editable.",
+                        file=sys.stderr,
+                    )
+                    return 2
             return 0
         goals = Path(norm[: idx + len(marker)].rstrip(os.sep))
         rel = norm[idx + len(marker):]
@@ -1098,6 +1470,19 @@ def main() -> int:
     sp = sub.add_parser("doctor")
     sp.add_argument("--fix", action="store_true")
     sp.set_defaults(fn=cmd_doctor)
+
+    sp = sub.add_parser("mission-init")
+    sp.set_defaults(fn=cmd_mission_init)
+
+    sp = sub.add_parser("mission-status")
+    sp.set_defaults(fn=cmd_mission_status)
+
+    sp = sub.add_parser("mission-brief")
+    sp.set_defaults(fn=cmd_mission_brief)
+
+    sp = sub.add_parser("mission-verdict")
+    sp.add_argument("decision", choices=["proceed", "done", "escalate"])
+    sp.set_defaults(fn=cmd_mission_verdict)
 
     sp = sub.add_parser("hook-guard")
     sp.set_defaults(fn=cmd_hook_guard)

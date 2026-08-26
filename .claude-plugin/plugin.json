@@ -1,6 +1,6 @@
 {
   "name": "goalkeeper",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Durable goal-following for Claude Code: contracts with definition-of-done, subagent judge gates, executor-subagent chain execution, and adaptive missions — with all state mechanics executed by a tested CLI and invariants enforced by hooks. Inspired by OpenAI Codex /goal and the Ralph loop pattern.",
   "author": {
     "name": "Youssef Hemimy",

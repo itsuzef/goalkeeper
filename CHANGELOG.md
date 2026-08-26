@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-26
+
+**The mission layer gets the gk treatment.** The supervisor was the last tier whose state files were hand-written by prose; its mechanics now run through gk, its state files are hook-protected, and the layer finally has end-to-end tests.
+
+### Added
+
+- `gk mission-init` — requires the user-authored `.claude/mission.md` charter, refuses while any goal is in flight (active, paused, or needs_human), initializes `mission.json` + `mission-log.md`; idempotent on re-run.
+- `gk mission-brief` — deterministic supervisor prompt assembly: charter verbatim, mission progress, the prior goal's `state.json` + compacted log (gk locates the most-recently-ended goal itself, live or archived, and frames the first-invocation case), repo state, and the PROCEED/DONE/ESCALATE task block with the escalate-over-proceed failure modes baked in.
+- `gk mission-verdict proceed|done|escalate` — applies the supervisor's structured response from stdin: mission-log entry, verdict + prior-goal completion recorded in `mission.json`, a verdict note in the prior goal's own log, status transitions, and the `mission-completed.md` snapshot on done. Refuses a verdict missing its required section (NEXT_OBJECTIVE / DONE_EVIDENCE / ESCALATION) and enforces **one supervisor invocation per goal-completion**.
+- `gk mission-status`, plus a mission summary line in `gk status`.
+- Hook coverage: `mission.json`, `mission-log.md`, and `mission-completed.md` are blocked from direct Edit/Write while the mission is live (active or escalated). The charter `mission.md` is never blocked — it stays user-editable by design.
+- 32 new assertions in `scripts/test-gk.py` (114 total): full mission lifecycle, escalate path, verdict-section requirements, double-invocation guard, and mission hook-guard block/allow behavior.
+
+### Changed
+
+- `skills/goal-supervisor/SKILL.md` rewritten to judgment-only: init → brief → spawn subagent → apply verdict via gk. The on-disk mission shapes moved out of the skill — `scripts/gk.py` owns them now, matching the goal/chain layer.
+
+### Migration notes
+
+- Mission file locations and shapes are unchanged (`.claude/mission.md` / `mission.json` / `mission-log.md` / `mission-completed.md`); an in-flight v0.2+ mission continues under v0.5.
+- Hook changes require a plugin reload.
+
 ## [0.4.1] - 2026-08-26
 
 Supervisor-layer fixes — two defects in `goal-supervisor/SKILL.md`:

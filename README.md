@@ -294,7 +294,7 @@ By default everything under `.claude/goals/` is gitignored. To share a contract 
 
 ### The gk CLI — mechanism lives in code, not prose (v0.4)
 
-Every state transition — activate, checkpoint, validate, judge verdict, chain advance, pause, resume, clear — is executed by [`scripts/gk.py`](./scripts/gk.py), a dependency-free Python CLI. The skills carry judgment (what to do next, what to ask the user, what to put in a prompt); gk carries mechanism (every write to the files below). This is what makes the shapes drift-proof: there is exactly one implementation, exercised end-to-end by [`scripts/test-gk.py`](./scripts/test-gk.py).
+Every state transition — activate, checkpoint, validate, judge verdict, chain advance, pause, resume, clear, and (v0.5) mission init/verdicts — is executed by [`scripts/gk.py`](./scripts/gk.py), a dependency-free Python CLI. The skills carry judgment (what to do next, what to ask the user, what to put in a prompt); gk carries mechanism (every write to the files below). This is what makes the shapes drift-proof: there is exactly one implementation, exercised end-to-end by [`scripts/test-gk.py`](./scripts/test-gk.py).
 
 Two consequences worth knowing as a user:
 

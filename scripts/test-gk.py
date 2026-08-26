@@ -367,6 +367,171 @@ def test_doctor(tmp: Path, v: bool) -> Test:
     return t
 
 
+PROCEED_RESPONSE = """VERDICT: proceed
+
+REASONING:
+The prior goal shipped the marker file; the mission needs docs next.
+
+NEXT_OBJECTIVE: Write the user documentation for the marker feature.
+"""
+
+DONE_RESPONSE = """VERDICT: done
+
+REASONING:
+Both success-condition items are demonstrated by the prior goals.
+
+DONE_EVIDENCE:
+- Marker exists: marker.txt shipped by my-goal
+"""
+
+ESCALATE_RESPONSE = """VERDICT: escalate
+
+REASONING:
+The charter's success condition references a metric no goal produced.
+
+ESCALATION:
+Need the user to define how conversion-rate is measured.
+"""
+
+MISSION_MD = """# Mission: test-mission
+
+## Objective
+
+Ship the marker feature end to end.
+
+## Success condition
+
+marker.txt exists and is documented.
+
+## Legal next-goal shapes
+
+- implement: create the marker
+- document: write the docs
+"""
+
+
+def make_mission_project(tmp: Path, name: str) -> Path:
+    """Project with a completed goal and a mission charter."""
+    proj = make_project(tmp, name)
+    write_contract(proj, "my-goal", "test -f marker.txt")
+    gk(proj, "activate", "my-goal")
+    (proj / "marker.txt").write_text("done\n")
+    gk(proj, "verdict", "my-goal", "approve", stdin=APPROVE_RESPONSE)
+    (proj / ".claude" / "mission.md").write_text(MISSION_MD)
+    return proj
+
+
+def test_mission_lifecycle(tmp: Path, v: bool) -> Test:
+    t = Test("mission: init → brief → proceed → done, with guards", v)
+    proj = make_project(tmp, "mission")
+    claude = proj / ".claude"
+
+    r = gk(proj, "mission-init")
+    t.check("init refused without mission.md", r.returncode != 0)
+
+    (claude / "mission.md").write_text(MISSION_MD)
+    write_contract(proj, "my-goal", "test -f marker.txt")
+    gk(proj, "activate", "my-goal")
+    r = gk(proj, "mission-init")
+    t.check("init refused while a goal is in flight", r.returncode != 0)
+
+    (proj / "marker.txt").write_text("done\n")
+    gk(proj, "verdict", "my-goal", "approve", stdin=APPROVE_RESPONSE)
+    r = gk(proj, "mission-init")
+    t.check("init succeeds after goal done", r.returncode == 0)
+    mission = read_json(claude / "mission.json")
+    t.check("mission.json shape: name from charter, active, empty lists",
+            mission["name"] == "test-mission" and mission["status"] == "active"
+            and mission["goals_completed"] == []
+            and mission["supervisor_verdicts"] == [])
+    r = gk(proj, "mission-init")
+    t.check("re-init is a no-op", r.returncode == 0 and "already" in r.stdout)
+
+    r = gk(proj, "mission-brief")
+    t.check("brief exits 0", r.returncode == 0)
+    out = r.stdout
+    for section in ("# Mission charter", "# Prior goal: my-goal",
+                    "# Repo state", "VERDICT: proceed", "NEXT_OBJECTIVE"):
+        t.check(f"brief contains '{section}'", section in out)
+    t.check("brief carries prior goal's compacted log", "— activated" in out)
+
+    r = gk(proj, "mission-verdict", "proceed", stdin=PROCEED_RESPONSE)
+    t.check("proceed prints PROCEED + objective",
+            "PROCEED" in r.stdout and "user documentation" in r.stdout)
+    mission = read_json(claude / "mission.json")
+    t.check("verdict + goals_completed recorded",
+            mission["supervisor_verdicts"][-1]["verdict"] == "proceed"
+            and mission["goals_completed"][0]["slug"] == "my-goal"
+            and mission["goals_completed"][0]["result"] == "approved")
+    t.check("mission-log entry appended",
+            "supervisor verdict: proceed" in
+            (claude / "mission-log.md").read_text())
+    t.check("prior goal's log notes the verdict",
+            "supervisor verdict" in
+            (claude / "goals" / "my-goal" / "log.md").read_text())
+
+    r = gk(proj, "mission-verdict", "proceed", stdin=PROCEED_RESPONSE)
+    t.check("second verdict on same prior goal refused", r.returncode != 0)
+
+    # complete a second goal, then close the mission
+    write_contract(proj, "doc-goal", "true")
+    gk(proj, "activate", "doc-goal")
+    gk(proj, "verdict", "doc-goal", "approve", stdin=APPROVE_RESPONSE)
+    r = gk(proj, "mission-verdict", "done", stdin=DONE_RESPONSE)
+    t.check("done prints DONE", "DONE" in r.stdout)
+    mission = read_json(claude / "mission.json")
+    t.check("mission done with completed_at",
+            mission["status"] == "done" and bool(mission.get("completed_at")))
+    snapshot = (claude / "mission-completed.md").read_text()
+    t.check("mission-completed.md snapshot has charter + evidence",
+            "test-mission" in snapshot and "Marker exists" in snapshot)
+    r = gk(proj, "mission-verdict", "escalate", stdin=ESCALATE_RESPONSE)
+    t.check("verdicts refused on a non-active mission", r.returncode != 0)
+    return t
+
+
+def test_mission_escalate_and_guards(tmp: Path, v: bool) -> Test:
+    t = Test("mission: escalate path + verdict section requirements", v)
+    proj = make_mission_project(tmp, "mission-esc")
+    gk(proj, "mission-init")
+    r = gk(proj, "mission-verdict", "proceed", stdin="VERDICT: proceed\n")
+    t.check("proceed without NEXT_OBJECTIVE refused", r.returncode != 0)
+    r = gk(proj, "mission-verdict", "escalate", stdin=ESCALATE_RESPONSE)
+    t.check("escalate prints ESCALATE + required input",
+            "ESCALATE" in r.stdout and "conversion-rate" in r.stdout)
+    mission = read_json(proj / ".claude" / "mission.json")
+    t.check("mission status escalated", mission["status"] == "escalated")
+    return t
+
+
+def test_mission_hook_guard(tmp: Path, v: bool) -> Test:
+    t = Test("hook-guard: mission files blocked while live, charter never", v)
+    proj = make_mission_project(tmp, "mission-hook")
+    claude = proj / ".claude"
+
+    r = hook(proj, "Edit", str(claude / "mission-log.md"))
+    t.check("allows mission-log.md before init", r.returncode == 0)
+    gk(proj, "mission-init")
+    for fname in ("mission.json", "mission-log.md", "mission-completed.md"):
+        r = hook(proj, "Edit", str(claude / fname))
+        t.check(f"blocks {fname} while mission active", r.returncode == 2)
+    r = hook(proj, "Edit", str(claude / "mission.md"))
+    t.check("mission.md (user charter) never blocked", r.returncode == 0)
+    r = hook(proj, "Edit", str(claude / "settings.json"))
+    t.check("other .claude files untouched", r.returncode == 0)
+
+    gk(proj, "mission-verdict", "escalate", stdin=ESCALATE_RESPONSE)
+    r = hook(proj, "Edit", str(claude / "mission.json"))
+    t.check("still blocked while escalated", r.returncode == 2)
+
+    mission = read_json(claude / "mission.json")
+    mission["status"] = "done"
+    (claude / "mission.json").write_text(json.dumps(mission))
+    r = hook(proj, "Edit", str(claude / "mission.json"))
+    t.check("allowed after mission done", r.returncode == 0)
+    return t
+
+
 def hook(proj: Path, tool: str, path: str):
     payload = json.dumps({"tool_name": tool, "tool_input": {"file_path": path}})
     return gk(proj, "hook-guard", stdin=payload)
@@ -422,6 +587,9 @@ def main() -> int:
         test_compact_log,
         test_doctor,
         test_hook_guard,
+        test_mission_lifecycle,
+        test_mission_escalate_and_guards,
+        test_mission_hook_guard,
     ]
     total_pass = total_fail = 0
     print("gk end-to-end suite\n")
