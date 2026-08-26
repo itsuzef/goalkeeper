@@ -100,7 +100,7 @@ Use the Agent tool with `subagent_type: general-purpose`. Fresh context — supe
 Pass a self-contained prompt with:
 
 1. **The full `mission.md`** — verbatim.
-2. **The prior goal's `log.md`** — verbatim. (May be long. If > 50KB, include the last 200 lines + activation entry + every "judge approved" and "judge rejected" block.)
+2. **The prior goal's log, compacted** — output of `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/gk.py" log <slug> --compact` (activation entry + every judge/lifecycle block + recent checkpoints; works for archived goals too).
 3. **The prior goal's `state.json`** — verbatim. (Tells the supervisor whether the goal was approved, how many rejections, etc.)
 4. **The current `mission.json.goals_completed`** — list of prior slug + brief result summary.
 5. **A list of supervisor-relevant repo state**: `git rev-parse HEAD` at this moment, `git status --porcelain` (first 20 lines).

@@ -7,19 +7,15 @@ You are operating the **goal-pause** skill.
 
 ## Flow
 
-1. Read `.claude/goals/active.json`. If no active goal, tell the user and stop.
-2. Read `.claude/goals/<slug>/state.json`.
-3. If `state.status` is already `paused`, `done`, or `needs_human`, tell the user the current status and stop (no state change).
-4. Set `state.status = paused`, add `paused_at: <ISO8601>`.
-5. Append to `log.md`:
-   ```
-   ## <ISO8601> — paused
-   Paused by user. No further iterations will run until /goal-resume.
-   ```
-6. Confirm to the user: "Paused goal `<slug>`. Resume with /goal-resume."
+Run:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/gk.py" pause
+```
+
+gk handles everything: it refuses cleanly if there is no active goal or the goal is already paused/done/needs_human, and otherwise sets `status = paused`, stamps `paused_at`, and appends the log entry. Relay its output to the user.
 
 ## Hard rules
 
-- Do not cancel or alter any pending ScheduleWakeup. The wakeup prompt explicitly checks `state.status != active` and stops, so a stale wakeup is a no-op.
-- Do not modify `rejection_count` or any other field besides `status` and `paused_at`.
-- The log entry is append-only.
+- Do not cancel or alter any pending ScheduleWakeup. The wakeup prompt checks status via `gk status` and stops when not active, so a stale wakeup is a no-op.
+- Do not touch any state beyond what `gk pause` writes.
