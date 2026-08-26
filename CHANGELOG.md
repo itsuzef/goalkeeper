@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-26
+
+Supervisor-layer fixes — two defects in `goal-supervisor/SKILL.md`:
+
+### Fixed
+
+- **Stale active-state path.** The pre-flight, inputs, and prior-goal-location steps referenced `.claude/active.json`; the file actually lives at `.claude/goals/active.json`. A supervisor following the instructions literally would read a nonexistent file, conclude no goal is active, and bypass its own refuse-while-active guard. State checks now route through `gk status` (which also treats paused/needs_human goals as in-flight, not just `active`).
+- **Auto-activation contradiction.** The frontmatter description promised PROCEED would "draft + activate the next goal," while the body and hard rules mandate the opposite — the drafted contract goes through `/goal-prep`'s user-review checkpoint and is never auto-activated. The description now matches the body: PROCEED means "propose and draft," never "activate."
+
 ## [0.4.0] - 2026-08-26
 
 **The gk CLI: state mechanics move from prose to code.** Every state transition (activate, checkpoint, validate, verdict, chain advance, pause, resume, clear) is now executed by `scripts/gk.py` — a single dependency-free Python CLI — instead of being hand-performed by the model following ~2,000 lines of SKILL.md instructions. Skills carry judgment (what to do); gk carries mechanism (the writes). A new PreToolUse hook turns goalkeeper's hard rules into mechanical guarantees.

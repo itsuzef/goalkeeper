@@ -1,6 +1,6 @@
 ---
 name: goal-supervisor
-description: The mission-level supervisor. One level above goals. Reads the user's mission charter and the most-recently-completed goal's artifacts, then decides whether to PROCEED (draft + activate the next goal), declare the mission DONE, or ESCALATE to the user. Use this skill when the user invokes /goal-supervisor after a goal completes, or when running a multi-goal arc where each next goal's shape is informed by the prior goal's actual output.
+description: The mission-level supervisor. One level above goals. Reads the user's mission charter and the most-recently-completed goal's artifacts, then decides whether to PROCEED (draft the next goal's contract for user review — never auto-activate), declare the mission DONE, or ESCALATE to the user. Use this skill when the user invokes /goal-supervisor after a goal completes, or when running a multi-goal arc where each next goal's shape is informed by the prior goal's actual output.
 ---
 
 You are operating the **goal-supervisor** skill — the mission-level layer sitting one above individual goals. Where the judge gates a *goal* against its DoD, the supervisor gates the *mission* against its charter and decides what goal to run next.
@@ -18,14 +18,14 @@ The supervisor is **NOT** a chain. Chains commit to a linear sequence at chain-s
 
 ## When to invoke
 
-- After a standalone goal completes (status `done` or `cleared`, active.json terminal-shape).
+- After a standalone goal completes (status `done` or `cleared` — `.claude/goals/active.json` in terminal shape; `gk status` reports "No active goal").
 - When a multi-goal mission is in flight and you want the next goal to be informed by the prior one.
 - NEVER while a goal is `active` — supervisor refuses if a goal is still running.
 
 ## Inputs
 
 - `.claude/mission.md` — the user-authored mission charter. **Required** — supervisor refuses without it.
-- `.claude/active.json` — must be terminal-shape (no active goal).
+- `.claude/goals/active.json` — must be terminal-shape (no active goal). Check via `gk status` (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/gk.py" status`).
 - `.claude/mission.json` — supervisor state. May not exist on first invocation; supervisor initializes it.
 - `.claude/mission-log.md` — append-only mission-level audit trail. May not exist on first invocation.
 - The most-recently-ended goal's artifacts:
@@ -71,7 +71,7 @@ success condition — equivalent to a contract's non_goals at the mission level.
 ### Step 1 — pre-flight
 
 1. Read `.claude/mission.md`. If missing, halt with: "Supervisor requires `.claude/mission.md`. See goal-supervisor skill docs for the expected shape." Do not proceed.
-2. Read `.claude/active.json`. If `slug != null` AND the corresponding `state.json.status == "active"`, halt with: "Supervisor refuses while a goal is active. Pause or complete the current goal first."
+2. Run `gk status`. If it reports an active (or paused / needs_human) goal, halt with: "Supervisor refuses while a goal is in flight. Pause or complete the current goal first." Only a "No active goal" terminal state may proceed.
 3. Read `.claude/mission.json` if it exists; otherwise initialize:
    ```json
    {
@@ -87,7 +87,7 @@ success condition — equivalent to a contract's non_goals at the mission level.
 
 The most-recently-ended goal is the supervisor's primary input. In order of preference:
 
-1. If `active.json.previous_slug` is non-null: that's the slug.
+1. If `.claude/goals/active.json` has a non-null `previous_slug`: that's the slug (`gk status` also names it in its "Last:" line).
 2. Else look in `.claude/goals/_archive/` for the most-recently-archived directory.
 3. Else look in `.claude/goals/` for a directory whose `state.json.status == "done"` and isn't yet archived.
 
@@ -170,7 +170,7 @@ Read the subagent's structured response. Then:
    ```json
    {"slug": "<prior-slug>", "result": "<approved|cleared|...>", "rejection_count": <n>}
    ```
-4. **Hand off to `/goalkeeper:goal-prep`** with the proposed next-objective as the rough idea. The user reviews and approves/edits the drafted contract per the standard prep flow. **Do NOT auto-activate** — the user-review checkpoint at prep is the human-in-the-loop safety property and stays mandatory in v0.2.
+4. **Hand off to `/goalkeeper:goal-prep`** with the proposed next-objective as the rough idea. The user reviews and approves/edits the drafted contract per the standard prep flow. **Do NOT auto-activate** — the user-review checkpoint at prep is the human-in-the-loop safety property and is mandatory. "PROCEED" means "propose and draft", never "activate".
 5. Tell the user: "Supervisor verdict: PROCEED. Drafting next goal: `<objective>`. Review the contract before activating."
 
 #### DONE
