@@ -55,6 +55,11 @@ def gk(project: Path, *args: str, stdin: str = ""):
     )
 
 
+def mint(proj: Path, slug: str, *extra: str):
+    """Mint the single-use judge token a provenance-v1 verdict consumes."""
+    return gk(proj, "judge-brief", slug, *extra)
+
+
 def make_project(tmp: Path, name: str) -> Path:
     proj = tmp / name
     (proj / ".claude" / "goals").mkdir(parents=True)
@@ -156,6 +161,7 @@ def test_standalone_lifecycle(tmp: Path, v: bool) -> Test:
     t.check("validator passes → exit 0", r.returncode == 0)
     t.check("VALIDATOR: pass printed", "VALIDATOR: pass" in r.stdout)
 
+    mint(proj, "my-goal")
     r = gk(proj, "verdict", "my-goal", "reject", stdin=REJECT_RESPONSE)
     t.check("reject exits 0 with RETRY", "RETRY" in r.stdout)
     state = read_json(goals / "my-goal" / "state.json")
@@ -163,6 +169,7 @@ def test_standalone_lifecycle(tmp: Path, v: bool) -> Test:
     log = (goals / "my-goal" / "log.md").read_text()
     t.check("fix-list copied verbatim to log", "Create the marker file" in log)
 
+    mint(proj, "my-goal")
     r = gk(proj, "verdict", "my-goal", "approve", stdin=APPROVE_RESPONSE)
     t.check("approve prints DONE", "DONE" in r.stdout)
     state = read_json(goals / "my-goal" / "state.json")
@@ -183,7 +190,9 @@ def test_needs_human_and_resume(tmp: Path, v: bool) -> Test:
     write_contract(proj, "hard-goal", "true", max_rejections=2)
     gk(proj, "activate", "hard-goal")
 
+    mint(proj, "hard-goal")
     gk(proj, "verdict", "hard-goal", "reject", stdin=REJECT_RESPONSE)
+    mint(proj, "hard-goal")
     r = gk(proj, "verdict", "hard-goal", "reject", stdin=REJECT_RESPONSE)
     t.check("second reject prints NEEDS_HUMAN", "NEEDS_HUMAN" in r.stdout)
     state = read_json(goals / "hard-goal" / "state.json")
@@ -232,6 +241,7 @@ def test_chain_lifecycle(tmp: Path, v: bool) -> Test:
     state = read_json(goals / "link-one" / "state.json")
     t.check("chain_step 1 on first link", state.get("chain_step") == 1)
 
+    mint(proj, "link-one")
     r = gk(proj, "verdict", "link-one", "approve", stdin=APPROVE_RESPONSE)
     t.check("approve in chain prints NEXT: link-two", "NEXT: link-two" in r.stdout)
     chain = read_json(goals / "chain.json")
@@ -242,6 +252,7 @@ def test_chain_lifecycle(tmp: Path, v: bool) -> Test:
     active = read_json(goals / "active.json")
     t.check("active.json moved to link-two", active["slug"] == "link-two")
 
+    mint(proj, "link-two")
     r = gk(proj, "verdict", "link-two", "approve", stdin=APPROVE_RESPONSE)
     t.check("final approve prints CHAIN_COMPLETE", "CHAIN_COMPLETE" in r.stdout)
     chain = read_json(goals / "chain.json")
@@ -326,6 +337,7 @@ def test_compact_log(tmp: Path, v: bool) -> Test:
     gk(proj, "activate", "log-goal")
     for i in range(10):
         gk(proj, "checkpoint", "log-goal", "--message", f"checkpoint number {i}")
+    mint(proj, "log-goal")
     gk(proj, "verdict", "log-goal", "reject", stdin=REJECT_RESPONSE)
     r = gk(proj, "log", "log-goal", "--compact", "--checkpoints", "3")
     out = r.stdout
@@ -416,6 +428,7 @@ def make_mission_project(tmp: Path, name: str) -> Path:
     write_contract(proj, "my-goal", "test -f marker.txt")
     gk(proj, "activate", "my-goal")
     (proj / "marker.txt").write_text("done\n")
+    mint(proj, "my-goal")
     gk(proj, "verdict", "my-goal", "approve", stdin=APPROVE_RESPONSE)
     (proj / ".claude" / "mission.md").write_text(MISSION_MD)
     return proj
@@ -436,6 +449,7 @@ def test_mission_lifecycle(tmp: Path, v: bool) -> Test:
     t.check("init refused while a goal is in flight", r.returncode != 0)
 
     (proj / "marker.txt").write_text("done\n")
+    mint(proj, "my-goal")
     gk(proj, "verdict", "my-goal", "approve", stdin=APPROVE_RESPONSE)
     r = gk(proj, "mission-init")
     t.check("init succeeds after goal done", r.returncode == 0)
@@ -476,6 +490,7 @@ def test_mission_lifecycle(tmp: Path, v: bool) -> Test:
     # complete a second goal, then close the mission
     write_contract(proj, "doc-goal", "true")
     gk(proj, "activate", "doc-goal")
+    mint(proj, "doc-goal")
     gk(proj, "verdict", "doc-goal", "approve", stdin=APPROVE_RESPONSE)
     r = gk(proj, "mission-verdict", "done", stdin=DONE_RESPONSE)
     t.check("done prints DONE", "DONE" in r.stdout)
@@ -614,9 +629,96 @@ def test_hook_guard(tmp: Path, v: bool) -> Test:
     r = gk(proj, "hook-guard", stdin="not json at all {")
     t.check("fails open on garbage stdin", r.returncode == 0)
 
+    mint(proj, "guarded")
     gk(proj, "verdict", "guarded", "approve", stdin=APPROVE_RESPONSE)
     r = hook(proj, "Edit", str(goals / "guarded" / "log.md"))
     t.check("allows log.md again after goal done", r.returncode == 0)
+    return t
+
+
+
+def test_judge_provenance(tmp: Path, v: bool) -> Test:
+    t = Test("judge provenance: mint/consume, mode persistence, legacy path", v)
+    proj = make_project(tmp, "provenance")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "prov-goal", "true", max_rejections=5)
+    gk(proj, "activate", "prov-goal")
+    state = read_json(goals / "prov-goal" / "state.json")
+    t.check("activation stamps provenance_version 1",
+            state.get("provenance_version") == 1)
+    t.check("activation records executor observables",
+            isinstance(state.get("executor"), dict)
+            and state["executor"].get("recorded_at"))
+    t.check("judge_verdicts starts as empty list",
+            state.get("judge_verdicts") == [])
+
+    r = gk(proj, "verdict", "prov-goal", "reject", stdin=REJECT_RESPONSE)
+    t.check("verdict without a mint is refused",
+            r.returncode != 0 and "judge token" in (r.stderr + r.stdout))
+    state = read_json(goals / "prov-goal" / "state.json")
+    t.check("refused verdict leaves no record",
+            state["judge_verdicts"] == [] and state["rejection_count"] == 0)
+
+    r = mint(proj, "prov-goal")
+    t.check("judge-brief mints and says so on stderr",
+            r.returncode == 0 and "token minted" in r.stderr)
+    tok = read_json(goals / "prov-goal" / "judge-token.json")
+    t.check("token unused, mode defaults to contract (subagent)",
+            tok["used"] is False and tok["mode"] == "subagent"
+            and tok["token_id"])
+
+    r = hook(proj, "Edit", str(goals / "prov-goal" / "judge-token.json"))
+    t.check("hook-guard blocks direct edit of the token file",
+            r.returncode == 2)
+
+    r = gk(proj, "verdict", "prov-goal", "reject", stdin=REJECT_RESPONSE)
+    t.check("reject with token accepted", "RETRY" in r.stdout)
+    state = read_json(goals / "prov-goal" / "state.json")
+    t.check("verdict recorded append-only with executed mode",
+            len(state["judge_verdicts"]) == 1
+            and state["judge_verdicts"][0]["verdict"] == "reject"
+            and state["judge_verdicts"][0]["mode"] == "subagent"
+            and state["last_judge_mode"] == "subagent")
+    tok = read_json(goals / "prov-goal" / "judge-token.json")
+    t.check("token consumed (used + used_at)",
+            tok["used"] is True and tok.get("used_at"))
+
+    r = gk(proj, "verdict", "prov-goal", "reject", stdin=REJECT_RESPONSE)
+    t.check("a consumed token cannot be reused", r.returncode != 0)
+
+    mint(proj, "prov-goal", "--mode", "inline")
+    r = gk(proj, "verdict", "prov-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("inline token refused for gate-quality approve",
+            r.returncode != 0 and "inline" in (r.stderr + r.stdout))
+    r = gk(proj, "verdict", "prov-goal", "reject", stdin=REJECT_RESPONSE)
+    t.check("inline reject allowed and recorded as inline",
+            "RETRY" in r.stdout
+            and read_json(goals / "prov-goal" / "state.json")
+            ["judge_verdicts"][-1]["mode"] == "inline")
+
+    mint(proj, "prov-goal")
+    r = gk(proj, "verdict", "prov-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("fresh subagent mint approves to DONE", "DONE" in r.stdout)
+    state = read_json(goals / "prov-goal" / "state.json")
+    t.check("history holds every accepted verdict (3), none refused",
+            len(state["judge_verdicts"]) == 3
+            and [e["verdict"] for e in state["judge_verdicts"]]
+            == ["reject", "reject", "approve"])
+
+    # Pre-provenance goal (activated before the upgrade): no token required.
+    write_contract(proj, "legacy-goal", "true")
+    gk(proj, "activate", "legacy-goal")
+    sp = goals / "legacy-goal" / "state.json"
+    legacy = read_json(sp)
+    for k in ("provenance_version", "executor", "judge_verdicts"):
+        legacy.pop(k, None)
+    sp.write_text(json.dumps(legacy, indent=2))
+    r = gk(proj, "verdict", "legacy-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("legacy goal approves without a token", "DONE" in r.stdout)
+    legacy = read_json(sp)
+    t.check("legacy verdict recorded and flagged legacy",
+            legacy["judge_verdicts"][-1].get("legacy") is True
+            and legacy["judge_verdicts"][-1]["mode"] is None)
     return t
 
 
@@ -635,6 +737,7 @@ def main() -> int:
         test_compact_log,
         test_doctor,
         test_hook_guard,
+        test_judge_provenance,
         test_mission_lifecycle,
         test_mission_fresh_init,
         test_mission_escalate_and_recovery,

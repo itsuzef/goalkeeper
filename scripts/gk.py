@@ -16,8 +16,10 @@ Usage:
   gk baseline <slug> [--paths a,b,c]
   gk checkpoint <slug> [--message TEXT]          (message may come from stdin)
   gk validate <slug>
-  gk judge-brief <slug> [--executor-summary FILE]
-  gk verdict <slug> approve|reject               (judge's structured response on stdin)
+  gk judge-brief <slug> [--executor-summary FILE] [--mode subagent|inline]
+                                                 (mints the single-use judge token)
+  gk verdict <slug> approve|reject               (judge's structured response on stdin;
+                                                  consumes the judge token)
   gk advance [--fix]
   gk chain-start <chain-file>
   gk pause
@@ -387,6 +389,21 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _caller_observables() -> dict:
+    """Best-effort caller identity — observed evidence, not authenticated
+    identity. GK_ACTOR lets a harness name the acting agent explicitly."""
+    obs = {}
+    try:
+        import getpass
+        obs["user"] = getpass.getuser()
+    except Exception:
+        pass
+    actor = os.environ.get("GK_ACTOR") or os.environ.get("CLAUDE_SESSION_ID")
+    if actor:
+        obs["env_actor"] = actor
+    return obs
+
+
 def _activate(goals: Path, slug: str, chain_name: Optional[str] = None,
               chain_step: Optional[int] = None) -> None:
     """Shared activation mechanics — state.json + active.json + log entry."""
@@ -402,6 +419,13 @@ def _activate(goals: Path, slug: str, chain_name: Optional[str] = None,
         "last_checkpoint_at": None,
         "last_validator_result": None,
         "last_judge_verdict": None,
+        # Verdict provenance (v1): judge verdicts require a token minted by
+        # `gk judge-brief`; the executed judge mode is persisted per verdict.
+        # Goals activated before this field existed complete under their
+        # activation-time rules (no token required).
+        "provenance_version": 1,
+        "executor": {**_caller_observables(), "recorded_at": now_iso()},
+        "judge_verdicts": [],
     }
     if chain_step is not None:
         state["chain_step"] = chain_step
@@ -645,6 +669,25 @@ def cmd_judge_brief(args) -> int:
     out.append(diff_text)
     out.append("")
     out.append(JUDGE_TASK)
+
+    # Mint the single-use judge token. The verdict command consumes it —
+    # provenance (which mode actually ran) is stamped here by the CLI, never
+    # typed by the caller at verdict time. Mistranscription under drift is
+    # the failure this closes; a hostile caller is out of scope by design.
+    import secrets
+    contract_mode = meta.get("judge_mode") or "subagent"
+    mode = getattr(args, "mode", None) or contract_mode
+    write_json(goals / slug / "judge-token.json", {
+        "token_id": secrets.token_hex(8),
+        "minted_at": now_iso(),
+        "mode": mode,
+        "contract_mode": contract_mode,
+        "minted_by": _caller_observables(),
+        "used": False,
+    })
+    print(f"[gk] judge token minted for '{slug}' (mode={mode}, single-use) — "
+          f"the next `gk verdict {slug}` consumes it.", file=sys.stderr)
+
     print("\n".join(out))
     return 0
 
@@ -714,6 +757,43 @@ def cmd_verdict(args) -> int:
     reasons = _extract_section(raw, "REASONS") or raw.strip() or "(none provided)"
     meta, _, _ = load_contract(goals, slug)
     max_rej = meta.get("max_rejections") or 5
+
+    # Verdict provenance: goals activated at provenance_version >= 1 accept a
+    # verdict only against an unused token minted by `gk judge-brief`. The
+    # executed mode is read from the token — caller-typed provenance is not
+    # accepted. Pre-provenance goals complete under their activation-time
+    # rules (F10: no in-flight goal is stranded by the cutover).
+    prov = state.get("provenance_version") or 0
+    tok = None
+    mode = None
+    if prov >= 1:
+        tok = read_json(goals / slug / "judge-token.json")
+        if not tok or tok.get("used"):
+            die(f"no unused judge token for '{slug}' — run `gk judge-brief "
+                f"{slug}` first; it mints the single-use token this verdict "
+                f"consumes. Caller-typed provenance is not accepted.")
+        mode = tok.get("mode") or "subagent"
+        contract_mode = tok.get("contract_mode") or \
+            (meta.get("judge_mode") or "subagent")
+        if args.decision == "approve" and mode == "inline" \
+                and contract_mode == "subagent":
+            die(f"contract for '{slug}' requires judge_mode 'subagent' but "
+                f"this token was minted inline (advisory only) — an inline "
+                f"verdict does not convert into a gate-quality approval. "
+                f"Re-run `gk judge-brief {slug}` and spawn the subagent judge.")
+        tok["used"] = True
+        tok["used_at"] = now_iso()
+        write_json(goals / slug / "judge-token.json", tok)
+
+    entry = {"at": now_iso(), "verdict": args.decision, "mode": mode}
+    if tok:
+        entry["token_id"] = tok.get("token_id")
+        entry["token_minted_at"] = tok.get("minted_at")
+    else:
+        entry["legacy"] = True
+    state.setdefault("judge_verdicts", []).append(entry)
+    if mode:
+        state["last_judge_mode"] = mode
 
     if args.decision == "approve":
         state["last_judge_verdict"] = "approve"
@@ -1405,6 +1485,7 @@ def cmd_hook_guard(_args) -> int:
             f"{slug}{os.sep}contract.md",
             f"{slug}{os.sep}log.md",
             f"{slug}{os.sep}state.json",
+            f"{slug}{os.sep}judge-token.json",
             "active.json",
             "chain.json",
         }
@@ -1461,6 +1542,9 @@ def main() -> int:
     sp = sub.add_parser("judge-brief")
     sp.add_argument("slug")
     sp.add_argument("--executor-summary")
+    sp.add_argument("--mode", choices=["subagent", "inline"],
+                    help="judge mode actually being run; recorded into the "
+                         "minted token (default: the contract's judge_mode)")
     sp.set_defaults(fn=cmd_judge_brief)
 
     sp = sub.add_parser("verdict")

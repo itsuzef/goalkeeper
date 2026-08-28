@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-27
+
+Judge verdicts now carry provenance: which judge mode actually ran, enforced by a single-use token the CLI mints and consumes — an inline advisory read can no longer masquerade as a gate-quality subagent approval.
+
+### Added
+
+- **Judge verdict provenance.** `gk judge-brief` now mints a single-use judge token (`<slug>/judge-token.json`, hook-guarded) stamping the judge mode actually being run (`--mode` to declare inline; default is the contract's `judge_mode`). `gk verdict` consumes the token: a verdict with no unused token is refused, a consumed token cannot be reused, and caller-typed provenance is never accepted. An inline-minted token cannot deliver a gate-quality `approve` on a contract whose `judge_mode` is `subagent` — advisory verdicts do not convert into gate approvals.
+- **Append-only verdict history.** Goal state now records every accepted verdict in `judge_verdicts` (`{at, verdict, mode, token_id, token_minted_at}`), mirroring the mission tier's `supervisor_verdicts` shape, alongside `last_judge_mode`. Previously the executed judge mode was never persisted anywhere — an approval was indistinguishable from an advisory inline self-read after the fact.
+- **Executor observables at activation.** `state.json` records `provenance_version: 1` and best-effort caller identity (`user`, `GK_ACTOR`/`CLAUDE_SESSION_ID` when set) when a goal activates.
+
+### Compatibility
+
+- Goals activated before this release carry no `provenance_version` and complete under their activation-time rules — no token required, verdicts recorded with `legacy: true`. No in-flight goal is stranded by the upgrade.
+
+### Testing
+
+- New end-to-end test (18 assertions): mint/consume lifecycle, refusal without mint, single-use enforcement, inline→approve non-convertibility, hook-guard coverage of the token file, append-only history, and the legacy path. Existing verdict tests updated to mint first. 146 + 80 assertions all passing.
+
 ## [0.5.1] - 2026-08-26
 
 Two mission-layer bugs (user-found), plus a third latent one behind the second:

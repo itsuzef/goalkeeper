@@ -29,7 +29,7 @@ Do not edit, trim, or "improve" the brief. Comparable verdicts across runs requi
 
 ## Step 2 — run the judge
 
-Read `judge_mode` from the contract (default `subagent`); an explicit `--mode=` arg overrides.
+Read `judge_mode` from the contract (default `subagent`); an explicit `--mode=` arg overrides — and is recorded, not trusted: `gk judge-brief` mints a single-use judge token stamping the mode actually run, and `gk verdict` consumes that token. A verdict without a prior brief is refused, a consumed token cannot be reused, and an inline-minted token cannot deliver a gate-quality approval on a contract that requires `subagent`. Pass `--mode=inline` to judge-brief when running inline so the record is honest.
 
 **subagent (the gate-quality mode, default):** spawn a fresh **general-purpose** subagent via the Agent tool with the brief as its entire prompt. Independent context is the point — it catches placeholders and shortcuts the executing agent rationalized away. Never use inline mode for chain gating or final completion.
 
