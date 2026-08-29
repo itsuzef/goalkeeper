@@ -19,7 +19,9 @@ Usage:
   gk judge-brief <slug> [--executor-summary FILE] [--mode subagent|inline]
                                                  (mints the single-use judge token)
   gk verdict <slug> approve|reject               (judge's structured response on stdin;
-                                                  consumes the judge token)
+                                                  consumes the judge token and mints
+                                                  the verdict receipt)
+  gk receipt <slug>                              (print the exportable verdict receipt)
   gk advance [--fix]
   gk chain-start <chain-file>
   gk pause
@@ -747,6 +749,49 @@ def _advance_chain(goals: Path, chain: dict, approved_slug: str) -> str:
     return f"NEXT: {next_slug}"
 
 
+def _write_receipt(goals: Path, slug: str, meta: dict, state: dict,
+                   tok: dict, entry: dict) -> None:
+    """Mint the self-contained verdict receipt (provenance-v1 goals only).
+
+    The receipt is the exportable artifact a consumer outside this goals dir
+    (a TaskFlow edge, a release gate, another repo's lane) can carry and
+    re-verify: what was decided, by which judge mode, over which contract
+    hash and repo commit, under which single-use token. Like the token, it
+    is written by the CLI at the moment of the verdict — never typed by a
+    caller — and hook-guarded against direct edits.
+    """
+    import hashlib
+    root = project_root(goals)
+    head, dirty = git_baseline(root)
+    _, _, contract_path = load_contract(goals, slug)
+    write_json(goals / slug / "receipt.json", {
+        "receipt_version": 1,
+        "slug": slug,
+        "decision": entry["verdict"],
+        "at": entry["at"],
+        "mode": entry.get("mode"),
+        "contract_mode": tok.get("contract_mode")
+                         or (meta.get("judge_mode") or "subagent"),
+        # gate_quality is the one bit a cross-flow consumer keys on: an
+        # approve delivered by the subagent judge. Advisory inline verdicts
+        # and rejections are never gate-quality.
+        "gate_quality": entry["verdict"] == "approve"
+                        and entry.get("mode") == "subagent",
+        "token": {k: tok.get(k)
+                  for k in ("token_id", "minted_at", "minted_by", "used_at")},
+        "executor": state.get("executor"),
+        "contract_sha256":
+            hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+        "repo": {
+            "head": head,
+            "dirty_paths": dirty,
+            "started_at_commit": state.get("started_at_commit"),
+        },
+        "rejection_count": state.get("rejection_count", 0),
+        "verdict_index": len(state.get("judge_verdicts", [])) - 1,
+    })
+
+
 def cmd_verdict(args) -> int:
     goals = find_goals_dir()
     slug = args.slug
@@ -800,6 +845,8 @@ def cmd_verdict(args) -> int:
         state["approved_at"] = now_iso()
         save_state(goals, slug, state)
         append_log(goals, slug, "judge approved", f"Reasons:\n{reasons}")
+        if tok:
+            _write_receipt(goals, slug, meta, state, tok, entry)
         chain = _chain_active_at_cursor(goals, slug)
         if chain:
             result = _advance_chain(goals, chain, slug)
@@ -822,6 +869,8 @@ def cmd_verdict(args) -> int:
     state["last_judge_verdict"] = "reject"
     state["rejection_count"] = state.get("rejection_count", 0) + 1
     n = state["rejection_count"]
+    if tok:
+        _write_receipt(goals, slug, meta, state, tok, entry)
     append_log(goals, slug, "judge rejected",
                f"Reasons:\n{reasons}\n\nFix-list:\n{fix_list}\n\n"
                f"Rejection count: {n}/{max_rej}")
@@ -836,6 +885,22 @@ def cmd_verdict(args) -> int:
         save_state(goals, slug, state)
         print(f"REJECTED: {slug}  ({n}/{max_rej})")
         print("RETRY")
+    return 0
+
+
+def cmd_receipt(args) -> int:
+    """Print the goal's verdict receipt — the exportable provenance artifact."""
+    goals = find_goals_dir()
+    receipt = read_json(goals / args.slug / "receipt.json")
+    if receipt is None:
+        state = load_state(goals, args.slug) or {}
+        if not (state.get("provenance_version") or 0):
+            die(f"'{args.slug}' is a pre-provenance goal — receipts exist "
+                f"only for goals activated at provenance_version >= 1.")
+        die(f"no receipt for '{args.slug}' — a receipt is minted when "
+            f"`gk verdict` consumes a judge token. No verdict has been "
+            f"accepted yet.")
+    print(json.dumps(receipt, indent=2))
     return 0
 
 
@@ -1486,6 +1551,7 @@ def cmd_hook_guard(_args) -> int:
             f"{slug}{os.sep}log.md",
             f"{slug}{os.sep}state.json",
             f"{slug}{os.sep}judge-token.json",
+            f"{slug}{os.sep}receipt.json",
             "active.json",
             "chain.json",
         }
@@ -1551,6 +1617,10 @@ def main() -> int:
     sp.add_argument("slug")
     sp.add_argument("decision", choices=["approve", "reject"])
     sp.set_defaults(fn=cmd_verdict)
+
+    sp = sub.add_parser("receipt")
+    sp.add_argument("slug")
+    sp.set_defaults(fn=cmd_receipt)
 
     sp = sub.add_parser("chain-start")
     sp.add_argument("file")

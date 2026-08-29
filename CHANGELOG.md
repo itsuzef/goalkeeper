@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-29
+
+A verdict now leaves the building: the CLI mints a self-contained, exportable receipt at the moment it consumes a judge token, so a consumer outside the goals directory — a TaskFlow cross-flow edge, a release gate, another repository's lane — can carry and re-verify what was decided without access to goal state.
+
+### Added
+
+- **Verdict receipts.** `gk verdict` on a provenance-v1 goal now writes `<slug>/receipt.json` alongside consuming the token: decision, executed judge mode, `gate_quality` (an approve delivered by the subagent judge — the one bit a cross-flow consumer keys on), the consumed token (id, minted_by, minted/used timestamps), executor observables from activation, the contract's SHA-256, and the repo commit judged (`head`, dirty paths, `started_at_commit`). Like the token, the receipt is written by the CLI at the moment of the verdict — never typed by a caller — and hook-guarded against direct edits. Rejections mint receipts too; they are never gate-quality.
+- **`gk receipt <slug>`.** Prints the receipt for export. Refusals distinguish "no verdict accepted yet" from "pre-provenance goal" (goals activated before v0.6.0 mint no receipts and complete under their activation-time rules).
+
+### Testing
+
+- New end-to-end test (12 assertions): mint-on-reject and mint-on-approve, gate-quality bit, token/history agreement, contract-hash and repo-commit binding, hook-guard coverage of the receipt file, export via `gk receipt`, and the legacy path. 158 assertions all passing.
+
 ## [0.6.0] - 2026-08-27
 
 Judge verdicts now carry provenance: which judge mode actually ran, enforced by a single-use token the CLI mints and consumes — an inline advisory read can no longer masquerade as a gate-quality subagent approval.

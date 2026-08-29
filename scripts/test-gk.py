@@ -722,6 +722,74 @@ def test_judge_provenance(tmp: Path, v: bool) -> Test:
     return t
 
 
+def test_verdict_receipt(tmp: Path, v: bool) -> Test:
+    t = Test("verdict receipt: minted on verdict, exportable, hook-guarded", v)
+    proj = make_project(tmp, "receipt")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "rcpt-goal", "true", max_rejections=5)
+    gk(proj, "activate", "rcpt-goal")
+
+    r = gk(proj, "receipt", "rcpt-goal")
+    t.check("no receipt before any verdict",
+            r.returncode != 0 and "no receipt" in (r.stderr + r.stdout))
+
+    mint(proj, "rcpt-goal")
+    gk(proj, "verdict", "rcpt-goal", "reject", stdin=REJECT_RESPONSE)
+    rcpt = read_json(goals / "rcpt-goal" / "receipt.json")
+    t.check("reject mints a receipt", rcpt is not None)
+    t.check("reject receipt: decision, mode, not gate-quality",
+            rcpt["decision"] == "reject" and rcpt["mode"] == "subagent"
+            and rcpt["gate_quality"] is False
+            and rcpt["rejection_count"] == 1)
+    state = read_json(goals / "rcpt-goal" / "state.json")
+    t.check("receipt token id matches the consumed token in history",
+            rcpt["token"]["token_id"] == state["judge_verdicts"][0]["token_id"]
+            and rcpt["verdict_index"] == 0)
+
+    r = hook(proj, "Edit", str(goals / "rcpt-goal" / "receipt.json"))
+    t.check("hook-guard blocks direct edit of the receipt",
+            r.returncode == 2)
+
+    mint(proj, "rcpt-goal")
+    gk(proj, "verdict", "rcpt-goal", "approve", stdin=APPROVE_RESPONSE)
+    rcpt = read_json(goals / "rcpt-goal" / "receipt.json")
+    t.check("approve overwrites with a gate-quality receipt",
+            rcpt["decision"] == "approve" and rcpt["gate_quality"] is True
+            and rcpt["verdict_index"] == 1)
+    t.check("receipt binds the repo commit judged",
+            isinstance(rcpt["repo"]["head"], str)
+            and len(rcpt["repo"]["head"]) == 40
+            and rcpt["repo"]["started_at_commit"])
+    import hashlib
+    contract_hash = hashlib.sha256(
+        (goals / "rcpt-goal" / "contract.md").read_bytes()).hexdigest()
+    t.check("receipt binds the contract hash",
+            rcpt["contract_sha256"] == contract_hash)
+    t.check("receipt records executor observables",
+            isinstance(rcpt["executor"], dict))
+
+    r = gk(proj, "receipt", "rcpt-goal")
+    t.check("gk receipt prints parseable JSON",
+            r.returncode == 0
+            and json.loads(r.stdout)["decision"] == "approve")
+
+    # Pre-provenance goal: verdicts mint no receipt, and `gk receipt` says why.
+    write_contract(proj, "legacy-r", "true")
+    gk(proj, "activate", "legacy-r")
+    sp = goals / "legacy-r" / "state.json"
+    legacy = read_json(sp)
+    for k in ("provenance_version", "executor", "judge_verdicts"):
+        legacy.pop(k, None)
+    sp.write_text(json.dumps(legacy, indent=2))
+    gk(proj, "verdict", "legacy-r", "approve", stdin=APPROVE_RESPONSE)
+    t.check("legacy verdict mints no receipt",
+            not (goals / "legacy-r" / "receipt.json").exists())
+    r = gk(proj, "receipt", "legacy-r")
+    t.check("gk receipt explains the pre-provenance case",
+            r.returncode != 0 and "pre-provenance" in (r.stderr + r.stdout))
+    return t
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
@@ -738,6 +806,7 @@ def main() -> int:
         test_doctor,
         test_hook_guard,
         test_judge_provenance,
+        test_verdict_receipt,
         test_mission_lifecycle,
         test_mission_fresh_init,
         test_mission_escalate_and_recovery,
