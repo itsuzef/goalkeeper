@@ -40,12 +40,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -118,21 +121,55 @@ def read_json(path: Path) -> Optional[dict]:
         return None
 
 
+def write_text(path: Path, content: str) -> None:
+    """Durable atomic replacement: fsync temp, rename, then fsync directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.",
+                                    suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some filesystems do not permit directory fsync. The atomic
+            # rename still holds; recovery is provided by the verdict WAL.
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def json_text(payload: dict) -> str:
+    return json.dumps(payload, indent=2) + "\n"
+
+
 def write_json(path: Path, payload: dict) -> None:
-    """Atomic write: tmp + rename."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    tmp.replace(path)
+    write_text(path, json_text(payload))
+
+
+def log_block(at: str, title: str, body: str = "") -> str:
+    entry = f"\n## {at} — {title}\n"
+    if body.strip():
+        entry += body.rstrip() + "\n"
+    return entry
 
 
 def append_log(goals: Path, slug: str, title: str, body: str = "") -> None:
     log = goals / slug / "log.md"
     log.parent.mkdir(parents=True, exist_ok=True)
-    entry = f"\n## {now_iso()} — {title}\n"
-    if body.strip():
-        entry += body.rstrip() + "\n"
-    with log.open("a") as f:
-        f.write(entry)
+    prior = log.read_text() if log.is_file() else ""
+    write_text(log, prior + log_block(now_iso(), title, body))
 
 
 def active_info(goals: Path) -> Optional[str]:
@@ -246,6 +283,172 @@ def git_baseline(root: Path):
     return head.strip(), dirty
 
 
+def _git_bytes(root: Path, *args: str) -> Optional[bytes]:
+    try:
+        r = subprocess.run(["git", "-C", str(root), *args],
+                           capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _hash_part(digest, label: str, content: bytes) -> None:
+    label_bytes = label.encode("utf-8", "surrogateescape")
+    digest.update(len(label_bytes).to_bytes(8, "big"))
+    digest.update(label_bytes)
+    digest.update(len(content).to_bytes(8, "big"))
+    digest.update(content)
+
+
+def artifact_binding(root: Path, contract_path: Path) -> dict:
+    """Hash the exact contract, HEAD, and all tracked/untracked dirty bytes."""
+    head_raw = _git(root, "rev-parse", "HEAD")
+    head = head_raw.strip() if head_raw is not None else None
+    digest = hashlib.sha256()
+    # Goalkeeper's own control files mutate while minting/consuming a
+    # token and are not judged repository artifacts. Bind every other tracked
+    # and untracked byte while excluding only that internal namespace.
+    internal_exclude = ":(exclude).claude/goals/**"
+    status = _git_bytes(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        "--", ".", internal_exclude)
+    status_text = _git(
+        root, "status", "--porcelain=v1", "--untracked-files=all",
+        "--", ".", internal_exclude) or ""
+    dirty_paths = [
+        line[3:].strip() for line in status_text.splitlines() if line.strip()]
+    tracked = _git_bytes(
+        root, "diff", "--binary", "HEAD", "--", ".", internal_exclude)
+    untracked_raw = _git_bytes(
+        root, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", ".", internal_exclude)
+    if head is None or status is None or tracked is None or untracked_raw is None:
+        _hash_part(digest, "no-git", b"")
+    else:
+        _hash_part(digest, "status", status)
+        _hash_part(digest, "tracked-diff", tracked)
+        for raw_path in sorted(p for p in untracked_raw.split(b"\0") if p):
+            rel = raw_path.decode("utf-8", "surrogateescape")
+            candidate = root / rel
+            try:
+                mode = candidate.lstat().st_mode & 0o7777
+                if candidate.is_symlink():
+                    content = os.readlink(candidate).encode(
+                        "utf-8", "surrogateescape")
+                else:
+                    content = candidate.read_bytes()
+            except OSError as exc:
+                mode = 0
+                content = f"<unreadable:{exc.errno}>".encode()
+            _hash_part(digest, f"untracked-mode:{rel}", str(mode).encode())
+            _hash_part(digest, f"untracked:{rel}", content)
+    return {
+        "binding_version": 1,
+        "contract_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+        "repo_head": head,
+        "dirty_state_sha256": digest.hexdigest(),
+        "dirty_paths": dirty_paths,
+    }
+
+
+VERDICT_TRANSACTION = ".verdict-transaction.json"
+VERDICT_LOCK = ".verdict.lock"
+
+
+@contextmanager
+def verdict_lock(goals: Path):
+    """Serialize token checks, WAL publication, recovery, and receipt export."""
+    lock_path = goals / VERDICT_LOCK
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"0")
+                os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _transaction_path(goals: Path) -> Path:
+    return goals / VERDICT_TRANSACTION
+
+
+def _maybe_test_crash(role: str) -> None:
+    if os.environ.get("GK_TEST_CRASH_AFTER") == role:
+        os._exit(86)
+
+
+def _recover_verdict_transaction(goals: Path) -> bool:
+    """Replay a prepared verdict WAL. Receipt is always published last."""
+    journal_path = _transaction_path(goals)
+    if not journal_path.exists():
+        return False
+    tx = read_json(journal_path)
+    if not tx or tx.get("transaction_version") != 1:
+        die("corrupt verdict transaction journal — refusing to guess; "
+            "preserve it and repair with a reviewed recovery.")
+    writes = tx.get("writes")
+    if not isinstance(writes, list) or not writes:
+        die("corrupt verdict transaction journal (missing writes)")
+    if writes[-1].get("role") != "receipt":
+        die("unsafe verdict transaction journal (receipt is not last)")
+    base = goals.resolve()
+    seen = set()
+    for item in writes:
+        rel = item.get("path")
+        content = item.get("content")
+        role = item.get("role")
+        if not isinstance(rel, str) or not isinstance(content, str) \
+                or not isinstance(role, str) or rel in seen:
+            die("corrupt verdict transaction journal (invalid write)")
+        target = (goals / rel).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            die("unsafe verdict transaction journal path")
+        seen.add(rel)
+        write_text(target, content)
+        _maybe_test_crash(role)
+    journal_path.unlink()
+    try:
+        dir_fd = os.open(goals, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    return True
+
+
+def _publish_verdict_transaction(goals: Path, writes: list) -> None:
+    journal_path = _transaction_path(goals)
+    if journal_path.exists():
+        _recover_verdict_transaction(goals)
+    write_json(journal_path, {
+        "transaction_version": 1,
+        "prepared_at": now_iso(),
+        "writes": writes,
+    })
+    _maybe_test_crash("journal")
+    _recover_verdict_transaction(goals)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Validator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +544,8 @@ def compact_log(log_text: str, keep_checkpoints: int = 5) -> str:
 
 def cmd_status(args) -> int:
     goals = find_goals_dir()
+    with verdict_lock(goals):
+        _recover_verdict_transaction(goals)
     slug = active_info(goals)
     chain = read_json(goals / "chain.json")
     mission = read_mission(goals)
@@ -589,6 +794,7 @@ def cmd_judge_brief(args) -> int:
     root = project_root(goals)
     log_path = goals / slug / "log.md"
     log_text = log_path.read_text() if log_path.is_file() else "(no log)"
+    binding = artifact_binding(root, cpath)
 
     excludes = list(DEFAULT_EXCLUDES)
     for glob in meta.get("diff_excludes") or []:
@@ -639,6 +845,13 @@ def cmd_judge_brief(args) -> int:
     out.append("You are an independent judge reviewing a goalkeeper goal. "
                "You have not seen the executing agent's reasoning — review the "
                "artifacts only.\n")
+    out.append("# Bound artifact snapshot\n")
+    out.append(f"Contract SHA-256: {binding['contract_sha256']}")
+    out.append(f"Repository HEAD: {binding['repo_head'] or 'no-git'}")
+    out.append(f"Dirty-state SHA-256: {binding['dirty_state_sha256']}")
+    out.append("This verdict is valid only for this exact snapshot. If any "
+               "binding changes, gk refuses the verdict and requires a fresh "
+               "brief and re-review.\n")
     out.append("# Contract\n")
     out.append(cpath.read_text())
     out.append("\n# Progress log (compacted — full log on disk at "
@@ -672,10 +885,12 @@ def cmd_judge_brief(args) -> int:
     out.append("")
     out.append(JUDGE_TASK)
 
-    # Mint the single-use judge token. The verdict command consumes it —
-    # provenance (which mode actually ran) is stamped here by the CLI, never
-    # typed by the caller at verdict time. Mistranscription under drift is
-    # the failure this closes; a hostile caller is out of scope by design.
+    # Refuse to mint across a moving worktree: the prompt and token must
+    # describe one exact artifact snapshot.
+    brief = "\n".join(out)
+    if artifact_binding(root, cpath) != binding:
+        die("artifacts changed while assembling the judge brief — retry after "
+            "the worktree settles")
     import secrets
     contract_mode = meta.get("judge_mode") or "subagent"
     mode = getattr(args, "mode", None) or contract_mode
@@ -685,12 +900,15 @@ def cmd_judge_brief(args) -> int:
         "mode": mode,
         "contract_mode": contract_mode,
         "minted_by": _caller_observables(),
+        "artifact_binding": binding,
+        "brief_sha256": hashlib.sha256(brief.encode()).hexdigest(),
         "used": False,
     })
-    print(f"[gk] judge token minted for '{slug}' (mode={mode}, single-use) — "
-          f"the next `gk verdict {slug}` consumes it.", file=sys.stderr)
+    print(f"[gk] judge token minted for '{slug}' (mode={mode}, single-use, "
+          f"snapshot-bound) — the next `gk verdict {slug}` consumes it.",
+          file=sys.stderr)
 
-    print("\n".join(out))
+    print(brief)
     return 0
 
 
@@ -749,152 +967,282 @@ def _advance_chain(goals: Path, chain: dict, approved_slug: str) -> str:
     return f"NEXT: {next_slug}"
 
 
-def _write_receipt(goals: Path, slug: str, meta: dict, state: dict,
-                   tok: dict, entry: dict) -> None:
-    """Mint the self-contained verdict receipt (provenance-v1 goals only).
-
-    The receipt is the exportable artifact a consumer outside this goals dir
-    (a TaskFlow edge, a release gate, another repo's lane) can carry and
-    re-verify: what was decided, by which judge mode, over which contract
-    hash and repo commit, under which single-use token. Like the token, it
-    is written by the CLI at the moment of the verdict — never typed by a
-    caller — and hook-guarded against direct edits.
-    """
-    import hashlib
-    root = project_root(goals)
-    head, dirty = git_baseline(root)
-    _, _, contract_path = load_contract(goals, slug)
-    write_json(goals / slug / "receipt.json", {
-        "receipt_version": 1,
+def _build_receipt(slug: str, meta: dict, state: dict,
+                   tok: dict, entry: dict) -> dict:
+    """Build a snapshot-bound receipt; publication happens transactionally."""
+    binding = tok["artifact_binding"]
+    head = binding.get("repo_head")
+    gate_quality = (
+        entry["verdict"] == "approve"
+        and entry.get("mode") == "subagent"
+        and isinstance(head, str)
+        and re.fullmatch(r"[0-9a-f]{40}", head) is not None
+    )
+    return {
+        "receipt_version": 2,
+        "provenance_version": 1,
         "slug": slug,
         "decision": entry["verdict"],
         "at": entry["at"],
         "mode": entry.get("mode"),
         "contract_mode": tok.get("contract_mode")
                          or (meta.get("judge_mode") or "subagent"),
-        # gate_quality is the one bit a cross-flow consumer keys on: an
-        # approve delivered by the subagent judge. Advisory inline verdicts
-        # and rejections are never gate-quality.
-        "gate_quality": entry["verdict"] == "approve"
-                        and entry.get("mode") == "subagent",
-        "token": {k: tok.get(k)
-                  for k in ("token_id", "minted_at", "minted_by", "used_at")},
+        "gate_quality": gate_quality,
+        "token": {k: tok.get(k) for k in (
+            "token_id", "minted_at", "minted_by", "used_at", "brief_sha256")},
         "executor": state.get("executor"),
-        "contract_sha256":
-            hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+        "artifact_binding": binding,
+        # Compatibility aliases for v0.6 receipt readers. Values come from
+        # the brief-time binding, never from a later verdict-time sample.
+        "contract_sha256": binding["contract_sha256"],
         "repo": {
             "head": head,
-            "dirty_paths": dirty,
+            "dirty_paths": binding.get("dirty_paths", []),
+            "dirty_state_sha256": binding["dirty_state_sha256"],
             "started_at_commit": state.get("started_at_commit"),
         },
         "rejection_count": state.get("rejection_count", 0),
         "verdict_index": len(state.get("judge_verdicts", [])) - 1,
-    })
+    }
+
+
+def _goal_artifact_dir(goals: Path, slug: str) -> Optional[Path]:
+    direct = goals / slug
+    if direct.is_dir():
+        return direct
+    archive = goals / "_archive"
+    candidates = sorted(archive.glob(f"{slug}-*")) if archive.is_dir() else []
+    return candidates[-1] if candidates else None
+
+
+def _verified_receipt(goals: Path, slug: str) -> Optional[dict]:
+    goal_dir = _goal_artifact_dir(goals, slug)
+    if goal_dir is None:
+        return None
+    receipt_path = goal_dir / "receipt.json"
+    receipt = read_json(receipt_path)
+    if receipt is None:
+        if receipt_path.exists():
+            die(f"receipt integrity check failed for '{slug}' "
+                "(unreadable or invalid JSON)")
+        return None
+    if receipt.get("receipt_version") != 2:
+        die(f"receipt for '{slug}' predates snapshot binding (v0.6) and is "
+            "not eligible as a cross-flow gate — mint a fresh judge brief, "
+            "re-review the exact artifacts, and submit a fresh verdict.")
+    state = read_json(goal_dir / "state.json")
+    token = read_json(goal_dir / "judge-token.json")
+    index = receipt.get("verdict_index")
+    history = state.get("judge_verdicts") if state else None
+    if not isinstance(index, int) or not isinstance(history, list) \
+            or index < 0 or index >= len(history) or not token:
+        die(f"receipt integrity check failed for '{slug}'")
+    entry = history[index]
+    expected_hash = entry.get("receipt_sha256")
+    actual_hash = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    if not expected_hash or expected_hash != actual_hash:
+        die(f"receipt integrity check failed for '{slug}' (seal mismatch)")
+    if token.get("token_id") != receipt.get("token", {}).get("token_id") \
+            or entry.get("token_id") != token.get("token_id") \
+            or token.get("artifact_binding") != receipt.get("artifact_binding") \
+            or not token.get("used"):
+        die(f"receipt integrity check failed for '{slug}' (provenance mismatch)")
+    return receipt
+
+
+def _legacy_verdict(goals: Path, slug: str, state: dict, decision: str,
+                    raw: str, reasons: str, max_rej: int) -> int:
+    """Preserve activation-time behavior for pre-provenance goals."""
+    entry = {"at": now_iso(), "verdict": decision, "mode": None,
+             "legacy": True}
+    state.setdefault("judge_verdicts", []).append(entry)
+    if decision == "approve":
+        state.update({
+            "last_judge_verdict": "approve",
+            "approved_at": now_iso(),
+            "status": "done",
+        })
+        save_state(goals, slug, state)
+        append_log(goals, slug, "judge approved", f"Reasons:\n{reasons}")
+        chain = _chain_active_at_cursor(goals, slug)
+        if chain:
+            result = _advance_chain(goals, chain, slug)
+        else:
+            append_log(goals, slug, "done", "Judge approved; goal complete.")
+            write_json(goals / "active.json", {
+                "slug": None, "ended_at": now_iso(), "ended_reason": "done",
+                "previous_slug": slug,
+            })
+            result = "DONE"
+        print(f"APPROVED: {slug}")
+        print(result)
+        return 0
+    fix_list = _extract_section(raw, "FIX_LIST")
+    state["last_judge_verdict"] = "reject"
+    state["rejection_count"] = state.get("rejection_count", 0) + 1
+    n = state["rejection_count"]
+    if n >= max_rej:
+        state["status"] = "needs_human"
+        state["needs_human_at"] = now_iso()
+    save_state(goals, slug, state)
+    append_log(goals, slug, "judge rejected",
+               f"Reasons:\n{reasons}\n\nFix-list:\n"
+               f"{fix_list or '(judge provided no fix-list)'}\n\n"
+               f"Rejection count: {n}/{max_rej}")
+    if n >= max_rej:
+        append_log(goals, slug, "paused (max rejections)")
+    print(f"REJECTED: {slug}  ({n}/{max_rej})")
+    print("NEEDS_HUMAN" if n >= max_rej else "RETRY")
+    return 0
 
 
 def cmd_verdict(args) -> int:
     goals = find_goals_dir()
+    with verdict_lock(goals):
+        return _cmd_verdict_locked(args, goals)
+
+
+def _cmd_verdict_locked(args, goals: Path) -> int:
+    _recover_verdict_transaction(goals)
     slug = args.slug
     state = load_state(goals, slug)
     if state is None:
         die(f"no state.json for '{slug}'")
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     reasons = _extract_section(raw, "REASONS") or raw.strip() or "(none provided)"
-    meta, _, _ = load_contract(goals, slug)
+    meta, _, contract_path = load_contract(goals, slug)
     max_rej = meta.get("max_rejections") or 5
-
-    # Verdict provenance: goals activated at provenance_version >= 1 accept a
-    # verdict only against an unused token minted by `gk judge-brief`. The
-    # executed mode is read from the token — caller-typed provenance is not
-    # accepted. Pre-provenance goals complete under their activation-time
-    # rules (F10: no in-flight goal is stranded by the cutover).
     prov = state.get("provenance_version") or 0
-    tok = None
-    mode = None
-    if prov >= 1:
-        tok = read_json(goals / slug / "judge-token.json")
-        if not tok or tok.get("used"):
-            die(f"no unused judge token for '{slug}' — run `gk judge-brief "
-                f"{slug}` first; it mints the single-use token this verdict "
-                f"consumes. Caller-typed provenance is not accepted.")
-        mode = tok.get("mode") or "subagent"
-        contract_mode = tok.get("contract_mode") or \
-            (meta.get("judge_mode") or "subagent")
-        if args.decision == "approve" and mode == "inline" \
-                and contract_mode == "subagent":
-            die(f"contract for '{slug}' requires judge_mode 'subagent' but "
-                f"this token was minted inline (advisory only) — an inline "
-                f"verdict does not convert into a gate-quality approval. "
-                f"Re-run `gk judge-brief {slug}` and spawn the subagent judge.")
-        tok["used"] = True
-        tok["used_at"] = now_iso()
-        write_json(goals / slug / "judge-token.json", tok)
+    if prov < 1:
+        # Legacy upgrades remain usable, but never produce cross-flow receipts.
+        return _legacy_verdict(
+            goals, slug, state, args.decision, raw, reasons, max_rej)
 
-    entry = {"at": now_iso(), "verdict": args.decision, "mode": mode}
-    if tok:
-        entry["token_id"] = tok.get("token_id")
-        entry["token_minted_at"] = tok.get("minted_at")
-    else:
-        entry["legacy"] = True
+    hold_ms = os.environ.get("GK_TEST_HOLD_VERDICT_MS")
+    if hold_ms:
+        import time
+        time.sleep(float(hold_ms) / 1000)
+    tok = read_json(goals / slug / "judge-token.json")
+    if not tok or tok.get("used"):
+        die(f"no unused judge token for '{slug}' — run `gk judge-brief "
+            f"{slug}` first; it mints the single-use token this verdict "
+            f"consumes. Caller-typed provenance is not accepted.")
+    binding = tok.get("artifact_binding")
+    if not isinstance(binding, dict) or not tok.get("brief_sha256"):
+        die(f"judge token for '{slug}' predates snapshot binding (v0.6) — "
+            "mint a fresh judge brief and re-review the exact artifacts.")
+    current_binding = artifact_binding(project_root(goals), contract_path)
+    if current_binding != binding:
+        die(f"artifacts changed after the judge brief for '{slug}' — verdict "
+            "refused without consuming the token. Mint a fresh judge brief "
+            "and re-review the new contract/HEAD/dirty-state snapshot.")
+    mode = tok.get("mode") or "subagent"
+    contract_mode = tok.get("contract_mode") or (
+        meta.get("judge_mode") or "subagent")
+    if args.decision == "approve" and mode == "inline" \
+            and contract_mode == "subagent":
+        die(f"contract for '{slug}' requires judge_mode 'subagent' but "
+            f"this token was minted inline (advisory only) — an inline "
+            f"verdict does not convert into a gate-quality approval. "
+            f"Re-run `gk judge-brief {slug}` and spawn the subagent judge.")
+
+    verdict_at = now_iso()
+    tok["used"] = True
+    tok["used_at"] = verdict_at
+    entry = {
+        "at": verdict_at,
+        "verdict": args.decision,
+        "mode": mode,
+        "token_id": tok.get("token_id"),
+        "token_minted_at": tok.get("minted_at"),
+        "artifact_binding": binding,
+        "brief_sha256": tok.get("brief_sha256"),
+    }
     state.setdefault("judge_verdicts", []).append(entry)
-    if mode:
-        state["last_judge_mode"] = mode
+    state["last_judge_mode"] = mode
+    log_path = goals / slug / "log.md"
+    final_log = log_path.read_text() if log_path.is_file() else ""
+    chain = _chain_active_at_cursor(goals, slug)
 
     if args.decision == "approve":
-        state["last_judge_verdict"] = "approve"
-        state["approved_at"] = now_iso()
-        save_state(goals, slug, state)
-        append_log(goals, slug, "judge approved", f"Reasons:\n{reasons}")
-        if tok:
-            _write_receipt(goals, slug, meta, state, tok, entry)
-        chain = _chain_active_at_cursor(goals, slug)
-        if chain:
-            result = _advance_chain(goals, chain, slug)
-            print(f"APPROVED: {slug}")
-            print(result)
-        else:
-            state["status"] = "done"
-            save_state(goals, slug, state)
-            append_log(goals, slug, "done", "Judge approved; goal complete.")
-            write_json(goals / "active.json", {
-                "slug": None, "ended_at": now_iso(), "ended_reason": "done",
-                "previous_slug": slug,
-            })
-            print(f"APPROVED: {slug}")
-            print("DONE")
-        return 0
-
-    # reject
-    fix_list = _extract_section(raw, "FIX_LIST") or "(judge provided no fix-list)"
-    state["last_judge_verdict"] = "reject"
-    state["rejection_count"] = state.get("rejection_count", 0) + 1
-    n = state["rejection_count"]
-    if tok:
-        _write_receipt(goals, slug, meta, state, tok, entry)
-    append_log(goals, slug, "judge rejected",
-               f"Reasons:\n{reasons}\n\nFix-list:\n{fix_list}\n\n"
-               f"Rejection count: {n}/{max_rej}")
-    if n >= max_rej:
-        state["status"] = "needs_human"
-        state["needs_human_at"] = now_iso()
-        save_state(goals, slug, state)
-        append_log(goals, slug, "paused (max rejections)")
-        print(f"REJECTED: {slug}  ({n}/{max_rej})")
-        print("NEEDS_HUMAN")
+        state.update({
+            "last_judge_verdict": "approve",
+            "approved_at": verdict_at,
+            "status": "done",
+        })
+        final_log += log_block(
+            verdict_at, "judge approved", f"Reasons:\n{reasons}")
+        if chain is None:
+            final_log += log_block(
+                verdict_at, "done", "Judge approved; goal complete.")
     else:
-        save_state(goals, slug, state)
+        fix_list = _extract_section(raw, "FIX_LIST") or \
+            "(judge provided no fix-list)"
+        state["last_judge_verdict"] = "reject"
+        state["rejection_count"] = state.get("rejection_count", 0) + 1
+        n = state["rejection_count"]
+        if n >= max_rej:
+            state["status"] = "needs_human"
+            state["needs_human_at"] = verdict_at
+        final_log += log_block(
+            verdict_at, "judge rejected",
+            f"Reasons:\n{reasons}\n\nFix-list:\n{fix_list}\n\n"
+            f"Rejection count: {n}/{max_rej}")
+        if n >= max_rej:
+            final_log += log_block(verdict_at, "paused (max rejections)")
+
+    receipt = _build_receipt(slug, meta, state, tok, entry)
+    receipt_content = json_text(receipt)
+    entry["receipt_sha256"] = hashlib.sha256(
+        receipt_content.encode()).hexdigest()
+    writes = [
+        {"path": f"{slug}/judge-token.json", "role": "token",
+         "content": json_text(tok)},
+        {"path": f"{slug}/state.json", "role": "state",
+         "content": json_text(state)},
+        {"path": f"{slug}/log.md", "role": "log", "content": final_log},
+    ]
+    if args.decision == "approve" and chain is None:
+        writes.append({
+            "path": "active.json",
+            "role": "active",
+            "content": json_text({
+                "slug": None, "ended_at": verdict_at,
+                "ended_reason": "done", "previous_slug": slug,
+            }),
+        })
+    writes.append({
+        "path": f"{slug}/receipt.json",
+        "role": "receipt",
+        "content": receipt_content,
+    })
+    _publish_verdict_transaction(goals, writes)
+
+    if args.decision == "approve":
+        result = _advance_chain(goals, chain, slug) if chain else "DONE"
+        print(f"APPROVED: {slug}")
+        print(result)
+    else:
+        n = state["rejection_count"]
         print(f"REJECTED: {slug}  ({n}/{max_rej})")
-        print("RETRY")
+        print("NEEDS_HUMAN" if n >= max_rej else "RETRY")
     return 0
 
 
 def cmd_receipt(args) -> int:
-    """Print the goal's verdict receipt — the exportable provenance artifact."""
+    """Recover, verify, and print an exportable provenance receipt."""
     goals = find_goals_dir()
-    receipt = read_json(goals / args.slug / "receipt.json")
+    with verdict_lock(goals):
+        return _cmd_receipt_locked(args, goals)
+
+
+def _cmd_receipt_locked(args, goals: Path) -> int:
+    _recover_verdict_transaction(goals)
+    receipt = _verified_receipt(goals, args.slug)
     if receipt is None:
-        state = load_state(goals, args.slug) or {}
-        if not (state.get("provenance_version") or 0):
+        goal_dir = _goal_artifact_dir(goals, args.slug)
+        state = read_json(goal_dir / "state.json") if goal_dir else {}
+        if not ((state or {}).get("provenance_version") or 0):
             die(f"'{args.slug}' is a pre-provenance goal — receipts exist "
                 f"only for goals activated at provenance_version >= 1.")
         die(f"no receipt for '{args.slug}' — a receipt is minted when "
@@ -1060,8 +1408,12 @@ def cmd_log(args) -> int:
 
 
 def cmd_doctor(args) -> int:
-    """Detect (and with --fix repair) inconsistent chain state."""
+    """Recover verdict WALs and detect inconsistent chain state."""
     goals = find_goals_dir()
+    with verdict_lock(goals):
+        recovered = _recover_verdict_transaction(goals)
+    if recovered:
+        print("RECOVERED: completed pending verdict transaction.")
     chain = read_json(goals / "chain.json")
     problems = []
     if chain and chain.get("status") == "active":
@@ -1497,10 +1849,11 @@ def cmd_mission_resume(args) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cmd_hook_guard(_args) -> int:
-    """Block direct Edit/Write to an active goal's contract/log/state files.
+    """Block managed active files and every receipt, including archives.
 
     Exit 0 = allow, exit 2 = block (stderr shown to the model). Fails open on
-    any error — this hook must never brick unrelated edits.
+    unrelated parse errors, but receipt protection is path-based and does not
+    depend on active.json or receipt contents.
     """
     try:
         payload = json.load(sys.stdin)
@@ -1538,6 +1891,16 @@ def cmd_hook_guard(_args) -> int:
             return 0
         goals = Path(norm[: idx + len(marker)].rstrip(os.sep))
         rel = norm[idx + len(marker):]
+        if rel in (VERDICT_TRANSACTION, VERDICT_LOCK) \
+                or Path(rel).name == "receipt.json":
+            print(
+                f"goalkeeper hook-guard: '{rel}' is immutable receipt "
+                "evidence managed by gk. Direct edits are blocked even after "
+                "goal completion or archival; use `gk receipt <slug>` to "
+                "recover, integrity-check, and export it.",
+                file=sys.stderr,
+            )
+            return 2
         if rel.startswith("_archive" + os.sep) or rel.startswith("shared" + os.sep):
             return 0
         slug = active_info(goals)

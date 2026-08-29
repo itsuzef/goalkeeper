@@ -21,7 +21,7 @@ The verdict logic and grading rubric are identical across all three — they are
 gk judge-brief <slug> [--executor-summary <file>]
 ```
 
-This emits the complete, self-contained judge prompt: contract verbatim, compacted log, diff scope (git baseline, pre-existing dirty paths, validator baseline subtraction), the deduped file list to read end-to-end, the filtered diff (lockfiles/build outputs/IDE files excluded, plus contract `diff_excludes`), and the verdict-format instructions — including the requirement that **every MET verdict cites file:line evidence**.
+This emits the complete, self-contained judge prompt: contract verbatim, compacted log, diff scope (git baseline, pre-existing dirty paths, validator baseline subtraction), the deduped file list to read end-to-end, the filtered diff (lockfiles/build outputs/IDE files excluded, plus contract `diff_excludes`), and the verdict-format instructions — including the requirement that **every MET verdict cites file:line evidence**. The brief and token carry the same exact artifact binding: contract SHA-256, repository HEAD, and dirty-state SHA-256 over tracked and untracked bytes.
 
 In subagent mode (chain-driven), first write the executor's structured return (STATUS / SUMMARY / VALIDATOR_OUTPUT_TAIL / FILES_CHANGED) to a scratch file and pass it via `--executor-summary` — the brief marks it as a leading hint the judge must independently verify.
 
@@ -29,7 +29,7 @@ Do not edit, trim, or "improve" the brief. Comparable verdicts across runs requi
 
 ## Step 2 — run the judge
 
-Read `judge_mode` from the contract (default `subagent`); an explicit `--mode=` arg overrides — and is recorded, not trusted: `gk judge-brief` mints a single-use judge token stamping the mode actually run, and `gk verdict` consumes that token. A verdict without a prior brief is refused, a consumed token cannot be reused, and an inline-minted token cannot deliver a gate-quality approval on a contract that requires `subagent`. Pass `--mode=inline` to judge-brief when running inline so the record is honest.
+Read `judge_mode` from the contract (default `subagent`); an explicit `--mode=` arg overrides — and is recorded, not trusted: `gk judge-brief` mints a single-use judge token stamping the mode actually run, the exact artifact binding, and the brief SHA-256. `gk verdict` consumes that token only when contract, HEAD, and dirty-state still match. Artifact drift refuses the verdict without consuming the token: discard the prior judgment, mint a fresh brief, and perform a fresh review. A verdict without a prior brief is refused, a consumed token cannot be reused, and an inline-minted token cannot deliver a gate-quality approval on a contract that requires `subagent`. Pass `--mode=inline` to judge-brief when running inline so the record is honest.
 
 **subagent (the gate-quality mode, default):** spawn a fresh **general-purpose** subagent via the Agent tool with the brief as its entire prompt. Independent context is the point — it catches placeholders and shortcuts the executing agent rationalized away. Never use inline mode for chain gating or final completion.
 
@@ -54,7 +54,7 @@ gk verdict <slug> approve   <<'EOF' ... EOF
 gk verdict <slug> reject    <<'EOF' ... EOF
 ```
 
-gk updates state, appends the log entry (reasons and fix-list verbatim), handles the rejection threshold, and — when a chain is active — records the link approval and advances the cursor atomically. Read its output:
+gk prepares one durable verdict transaction, then publishes token consumption, state/history, log, terminal pointer, and the sealed receipt in that order; the receipt is last. A crash is replayed idempotently by `gk status`, `gk doctor`, `gk verdict`, or `gk receipt`. When a chain is active, gk then records the link approval and advances the cursor (doctor retains its existing chain-repair path). Read its output:
 
 - `DONE` — standalone goal complete; tell the user: "Goal `<slug>` approved and marked done."
 - `NEXT: <slug>` / `CHAIN_COMPLETE` — chain advanced; hand back to the goal-chain orchestrator.
@@ -75,4 +75,5 @@ gk updates state, appends the log entry (reasons and fix-list verbatim), handles
 - **A MET without file:line evidence is invalid.** If the judge returns one, treat that DoD line as unverified — re-run the judge rather than approving on it.
 - **Placeholders, skipped work, and non-goal violations are automatic rejection.**
 - The judge never modifies code or contract — verdict application goes through `gk verdict` only.
+- A v0.6 token or version-1 receipt is not upgradeable evidence. Mint a fresh brief and perform a fresh review before submitting a current verdict.
 - Subagent mode is the gate-quality mode. Inline is for fast advisory only.

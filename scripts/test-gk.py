@@ -15,7 +15,10 @@ Exit code 0 on all-pass, 1 on any failure. Requires: stdlib + git.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,12 +49,14 @@ class Test:
         return passes, fails
 
 
-def gk(project: Path, *args: str, stdin: str = ""):
+def gk(project: Path, *args: str, stdin: str = "", env=None):
     """Run gk in the project dir; return CompletedProcess."""
+    child_env = os.environ.copy()
+    child_env.update(env or {})
     return subprocess.run(
         [sys.executable, str(GK), *args],
         cwd=str(project), input=stdin, capture_output=True, text=True,
-        timeout=60,
+        timeout=60, env=child_env,
     )
 
 
@@ -790,6 +795,217 @@ def test_verdict_receipt(tmp: Path, v: bool) -> Test:
     return t
 
 
+def test_snapshot_binding_adversarial(tmp: Path, v: bool) -> Test:
+    t = Test("snapshot binding: contract, HEAD, and dirty bytes fail closed", v)
+    proj = make_project(tmp, "snapshot-binding")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "bound-goal", "true")
+    gk(proj, "activate", "bound-goal")
+    contract = goals / "bound-goal" / "contract.md"
+    original_contract = contract.read_text()
+
+    brief = mint(proj, "bound-goal")
+    token = read_json(goals / "bound-goal" / "judge-token.json")
+    emitted = brief.stdout[:-1] if brief.stdout.endswith("\n") else brief.stdout
+    binding = token.get("artifact_binding") or {}
+    t.check("token binds contract + HEAD + dirty digest",
+            len(binding.get("contract_sha256", "")) == 64
+            and len(binding.get("repo_head", "")) == 40
+            and len(binding.get("dirty_state_sha256", "")) == 64)
+    t.check("brief carries and hashes the exact bound snapshot",
+            binding["contract_sha256"] in brief.stdout
+            and binding["repo_head"] in brief.stdout
+            and binding["dirty_state_sha256"] in brief.stdout
+            and token["brief_sha256"]
+            == hashlib.sha256(emitted.encode()).hexdigest())
+
+    contract.write_text(original_contract + "\npost-brief mutation\n")
+    r = gk(proj, "verdict", "bound-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("contract drift refuses without consuming token",
+            r.returncode != 0 and "artifacts changed" in r.stderr
+            and read_json(goals / "bound-goal" / "judge-token.json")["used"] is False)
+    contract.write_text(original_contract)
+
+    mint(proj, "bound-goal")
+    (proj / "dirty.txt").write_text("version one\n")
+    r = gk(proj, "verdict", "bound-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("new dirty bytes after brief refuse verdict",
+            r.returncode != 0 and "dirty-state snapshot" in r.stderr)
+    (proj / "dirty.txt").unlink()
+
+    mint(proj, "bound-goal")
+    (proj / "head-change.txt").write_text("committed after brief\n")
+    subprocess.run(["git", "-C", str(proj), "add", "head-change.txt"],
+                   check=True, capture_output=True)
+    subprocess.run([
+        "git", "-C", str(proj), "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "head changed"], check=True, capture_output=True)
+    r = gk(proj, "verdict", "bound-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("HEAD drift refuses verdict", r.returncode != 0
+            and "artifacts changed" in r.stderr)
+    t.check("drift refusals publish no receipt and no history",
+            not (goals / "bound-goal" / "receipt.json").exists()
+            and read_json(goals / "bound-goal" / "state.json")
+            ["judge_verdicts"] == [])
+
+    mint(proj, "bound-goal")
+    r = gk(proj, "verdict", "bound-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("fresh brief over settled snapshot can approve",
+            r.returncode == 0 and "DONE" in r.stdout)
+    return t
+
+
+def test_verdict_transaction_recovery(tmp: Path, v: bool) -> Test:
+    t = Test("verdict WAL: crashes recover once, receipt publishes last", v)
+    proj = make_project(tmp, "verdict-wal")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "crash-goal", "true")
+    gk(proj, "activate", "crash-goal")
+    mint(proj, "crash-goal")
+    r = gk(proj, "verdict", "crash-goal", "approve",
+           stdin=APPROVE_RESPONSE, env={"GK_TEST_CRASH_AFTER": "state"})
+    t.check("injected crash leaves WAL and no authorization receipt",
+            r.returncode == 86
+            and (goals / ".verdict-transaction.json").exists()
+            and not (goals / "crash-goal" / "receipt.json").exists())
+
+    r = gk(proj, "receipt", "crash-goal")
+    state = read_json(goals / "crash-goal" / "state.json")
+    log = (goals / "crash-goal" / "log.md").read_text()
+    t.check("receipt export replays and clears pending transaction",
+            r.returncode == 0
+            and not (goals / ".verdict-transaction.json").exists())
+    t.check("recovery publishes one coherent verdict",
+            state["status"] == "done"
+            and len(state["judge_verdicts"]) == 1
+            and log.count("— judge approved") == 1
+            and log.count("— done") == 1
+            and read_json(goals / "active.json")["ended_reason"] == "done")
+    t.check("recovered receipt seal verifies",
+            json.loads(r.stdout)["gate_quality"] is True)
+
+    write_contract(proj, "receipt-crash", "true")
+    gk(proj, "activate", "receipt-crash")
+    mint(proj, "receipt-crash")
+    r = gk(proj, "verdict", "receipt-crash", "reject",
+           stdin=REJECT_RESPONSE, env={"GK_TEST_CRASH_AFTER": "receipt"})
+    t.check("crash after commit point leaves receipt plus recovery WAL",
+            r.returncode == 86
+            and (goals / "receipt-crash" / "receipt.json").exists()
+            and (goals / ".verdict-transaction.json").exists())
+    r = gk(proj, "receipt", "receipt-crash")
+    state = read_json(goals / "receipt-crash" / "state.json")
+    t.check("post-commit replay is idempotent",
+            r.returncode == 0 and len(state["judge_verdicts"]) == 1
+            and (goals / "receipt-crash" / "log.md").read_text()
+            .count("— judge rejected") == 1
+            and not (goals / ".verdict-transaction.json").exists())
+
+    race = make_project(tmp, "verdict-race")
+    race_goals = race / ".claude" / "goals"
+    write_contract(race, "race-goal", "true")
+    gk(race, "activate", "race-goal")
+    mint(race, "race-goal")
+    race_env = os.environ.copy()
+    race_env["GK_TEST_HOLD_VERDICT_MS"] = "250"
+    command = [sys.executable, str(GK), "verdict", "race-goal", "approve"]
+    first = subprocess.Popen(
+        command, cwd=str(race), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=race_env)
+    second = subprocess.Popen(
+        command, cwd=str(race), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=race_env)
+    # Feed both contenders before waiting: either process may win the lock.
+    for proc in (first, second):
+        proc.stdin.write(APPROVE_RESPONSE)
+        proc.stdin.close()
+    for proc in (first, second):
+        proc.wait(timeout=60)
+    race_state = read_json(race_goals / "race-goal" / "state.json")
+    t.check("concurrent verdicts consume one token exactly once",
+            sorted([first.returncode, second.returncode]) == [0, 1]
+            and len(race_state["judge_verdicts"]) == 1
+            and gk(race, "receipt", "race-goal").returncode == 0)
+    return t
+
+
+def test_receipt_teardown_integrity(tmp: Path, v: bool) -> Test:
+    t = Test("receipt teardown: terminal/archive hook + seal resist tampering", v)
+    proj = make_project(tmp, "receipt-teardown")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "sealed-goal", "true")
+    gk(proj, "activate", "sealed-goal")
+    mint(proj, "sealed-goal")
+    gk(proj, "verdict", "sealed-goal", "approve", stdin=APPROVE_RESPONSE)
+    receipt_path = goals / "sealed-goal" / "receipt.json"
+
+    r = hook(proj, "Edit", str(receipt_path))
+    t.check("approved receipt remains hook-blocked after active teardown",
+            r.returncode == 2 and "immutable receipt" in r.stderr)
+    t.check("terminal receipt verifies before archive",
+            gk(proj, "receipt", "sealed-goal").returncode == 0)
+
+    archive = goals / "_archive"
+    archive.mkdir(exist_ok=True)
+    archived_dir = archive / "sealed-goal-20990101-000000"
+    shutil.move(str(goals / "sealed-goal"), str(archived_dir))
+    archived_receipt = archived_dir / "receipt.json"
+    r = hook(proj, "Write", str(archived_receipt))
+    t.check("archived approved receipt remains hook-blocked",
+            r.returncode == 2 and "immutable receipt" in r.stderr)
+    t.check("archived receipt remains discoverable and verified",
+            gk(proj, "receipt", "sealed-goal").returncode == 0)
+
+    tampered = read_json(archived_receipt)
+    tampered["decision"] = "reject"
+    archived_receipt.write_text(json.dumps(tampered, indent=2) + "\n")
+    r = gk(proj, "receipt", "sealed-goal")
+    t.check("direct hook bypass is caught by receipt seal",
+            r.returncode != 0 and "seal mismatch" in r.stderr)
+    return t
+
+
+def test_v06_upgrade_requires_rereview(tmp: Path, v: bool) -> Test:
+    t = Test("v0.6 upgrade: stale token/receipt require fresh re-review", v)
+    proj = make_project(tmp, "v06-upgrade")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "upgrade-goal", "true")
+    gk(proj, "activate", "upgrade-goal")
+    mint(proj, "upgrade-goal")
+    token_path = goals / "upgrade-goal" / "judge-token.json"
+    old_token = read_json(token_path)
+    old_token.pop("artifact_binding", None)
+    old_token.pop("brief_sha256", None)
+    token_path.write_text(json.dumps(old_token, indent=2) + "\n")
+
+    r = gk(proj, "verdict", "upgrade-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("v0.6 token cannot be grandfathered into an approval",
+            r.returncode != 0 and "v0.6" in r.stderr
+            and "fresh judge brief" in r.stderr)
+    t.check("stale-token refusal leaves state untouched",
+            read_json(goals / "upgrade-goal" / "state.json")
+            ["judge_verdicts"] == [])
+
+    mint(proj, "upgrade-goal")
+    gk(proj, "verdict", "upgrade-goal", "approve", stdin=APPROVE_RESPONSE)
+    receipt_path = goals / "upgrade-goal" / "receipt.json"
+    old_receipt = read_json(receipt_path)
+    old_receipt["receipt_version"] = 1
+    receipt_path.write_text(json.dumps(old_receipt, indent=2) + "\n")
+    r = gk(proj, "receipt", "upgrade-goal")
+    t.check("v0.6 receipt is not accepted as a cross-flow gate",
+            r.returncode != 0 and "v0.6" in r.stderr
+            and "re-review" in r.stderr)
+
+    mint(proj, "upgrade-goal")
+    r = gk(proj, "verdict", "upgrade-goal", "approve", stdin=APPROVE_RESPONSE)
+    exported = gk(proj, "receipt", "upgrade-goal")
+    t.check("fresh brief + re-review emits current verified receipt",
+            r.returncode == 0 and exported.returncode == 0
+            and json.loads(exported.stdout)["receipt_version"] == 2)
+    return t
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
@@ -807,6 +1023,10 @@ def main() -> int:
         test_hook_guard,
         test_judge_provenance,
         test_verdict_receipt,
+        test_snapshot_binding_adversarial,
+        test_verdict_transaction_recovery,
+        test_receipt_teardown_integrity,
+        test_v06_upgrade_requires_rereview,
         test_mission_lifecycle,
         test_mission_fresh_init,
         test_mission_escalate_and_recovery,

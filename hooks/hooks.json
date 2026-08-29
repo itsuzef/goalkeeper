@@ -1,5 +1,5 @@
 {
-  "description": "Goalkeeper invariant enforcement: blocks direct Edit/Write to an active goal's contract.md, log.md, state.json, to active.json/chain.json, and to the live mission's mission.json/mission-log.md/mission-completed.md — those files are managed exclusively by the gk CLI so the audit trail and contract immutability are guarantees, not requests. The user-authored mission.md charter is never blocked. Fails open: allows everything when no goal or mission is live, and on any parse error.",
+  "description": "Goalkeeper invariant enforcement: blocks direct Edit/Write to an active goal's contract.md, log.md, state.json, active.json/chain.json, the verdict transaction journal, and every receipt.json even after completion or archival; it also protects the live mission's mission.json/mission-log.md/mission-completed.md. These files are managed by gk so the audit trail, receipt integrity, and contract immutability are guarantees rather than requests. The user-authored mission.md charter is never blocked.",
   "hooks": {
     "PreToolUse": [
       {

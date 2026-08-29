@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Judge tokens and briefs now bind the exact contract SHA-256, repository HEAD,
+  and a deterministic SHA-256 over tracked and untracked dirty bytes. `gk
+  verdict` recomputes the binding and refuses artifact drift without consuming
+  the token.
+- Provenance-v1 verdict publication now uses a process-shared lock and durable
+  write-ahead transaction. Concurrent verdicts cannot consume one token twice;
+  token consumption, verdict history/state, log, terminal pointer, and receipt
+  are replayable; the receipt is the final commit point. `gk status`, `gk
+  doctor`, `gk verdict`, and `gk receipt` recover a prepared transaction.
+- Current receipts are `receipt_version: 2`, sealed by the matching verdict
+  history entry and rechecked against token provenance by `gk receipt`.
+  Receipt paths remain hook-protected after goal completion and inside
+  `_archive/`.
+- v0.6 tokens and version-1 receipts have no artifact snapshot binding and are
+  fail-closed. They cannot be upgraded in place: mint a fresh judge brief,
+  perform a fresh review, and submit a new verdict. Pre-provenance goals retain
+  their activation-time behavior but never mint cross-flow receipts.
+
+### Testing
+
+- Added 23 focused assertions covering contract/HEAD/dirty-state drift,
+  brief hashing, concurrent token consumption, crash recovery before and after
+  the receipt commit point, terminal/archive hook enforcement, direct-tamper
+  seal detection, and the v0.6 fresh-review upgrade requirement. The
+  end-to-end suite now has 181 assertions.
+
 ## [0.7.0] - 2026-08-29
 
 A verdict now leaves the building: the CLI mints a self-contained, exportable receipt at the moment it consumes a judge token, so a consumer outside the goals directory — a TaskFlow cross-flow edge, a release gate, another repository's lane — can carry and re-verify what was decided without access to goal state.
