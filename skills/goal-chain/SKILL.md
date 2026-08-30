@@ -87,9 +87,13 @@ BLOCKERS: (only if status != validator_pass)
 
 ### 3. Receive executor return, spawn judge
 
-- **STATUS = blocked or needs_clarification** — checkpoint the BLOCKERS verbatim (`gk checkpoint <slug> --message "EXECUTOR BLOCKED: <blockers>"`), run `gk pause` so the chain waits rather than aborts, and tell the user: "Executor surfaced a blocker on `<slug>`: <one-line>. See `gk log <slug> --compact`. Resolve it, then /goal-resume to re-spawn the executor." Do NOT invoke the judge on a blocked return.
+- **STATUS = blocked or needs_clarification** — checkpoint the BLOCKERS verbatim (`gk checkpoint <slug> --message "EXECUTOR BLOCKED: <blockers>"`), then split on the blocker's kind:
+  - **Human-gated** (a credential, consent, account access, a decision only the user can make): `gk park <slug> --needs "<exactly what a person must provide>"`. This frees the active slot and sets the chain to `waiting` — **the goal is parked, not you.** Tell the user in one line what is needed, then **continue with other work** (another goal, another repo, the rest of your portfolio). When the user unblocks it, `gk resume <slug>` re-arms the chain.
+  - **Solvable** (missing tool, unclear code, failing environment): that is work, not a blocker — re-spawn the executor with the clarification added to the prompt. Do not park what an agent can fix.
 
-- **STATUS = validator_fail** — same handling, but name the failing validator so the user knows it is a test/lint issue specifically.
+  Do NOT invoke the judge on a blocked return.
+
+- **STATUS = validator_fail** — a test/lint failure is always the solvable kind: re-spawn the executor with the failure named. Never park on a validator failure.
 
 - **STATUS = validator_pass** — write the executor's structured return to a scratch file and invoke the **goal-judge** skill (subagent mode) — it runs `gk judge-brief <slug> --executor-summary <file>`, spawns the judge, and applies the verdict with `gk verdict`.
 
@@ -98,7 +102,7 @@ BLOCKERS: (only if status != validator_pass)
 - **`NEXT: <slug>`** — the link was approved; gk marked it done, recorded the approval, advanced the cursor, and activated the next goal (with a fresh git baseline so the previous link's output counts as pre-existing dirt for the next judge). Spawn the executor subagent for the printed slug per step 2, then loop back here.
 - **`CHAIN_COMPLETE`** — gk closed the chain and wrote terminal state. Tell the user: "Chain `<name>` complete. <N> goals approved sequentially — per-link timestamps in `chain.json.link_approvals`."
 - **`RETRY`** — judge rejected within budget; the fix-list is in the log. **Re-spawn the executor subagent** with the same prompt structure (the compacted log now carries the fix-list) plus one added directive line: "Address the judge's fix-list from the most recent 'judge rejected' block, then proceed per the standard execution loop." Loop back to step 3.
-- **`NEEDS_HUMAN`** — max rejections. Do not advance. Surface the fix-list verbatim and point at `/goal-resume` / `/goal-clear`.
+- **`NEEDS_HUMAN`** — max rejections. gk already parked the goal (slot freed, chain `waiting`, the need recorded in state). Do not advance. Surface the fix-list verbatim, point at `gk resume <slug> --reset-rejections` / `/goal-clear` — then **continue with other portfolio work.** A parked goal never idles the agent.
 
 ## Recovery
 
@@ -118,13 +122,15 @@ Run `gk status` for the summary line, then read `chain.json` and per-link `state
 ```
 Chain:     <name>
 Source:    <source_file>
-Status:    <active|done|aborted>
+Status:    <active|waiting|done|aborted>
 Progress:  <cursor>/<N>
 Goals:
   [x] <slug 1>  — done       approved <ISO8601 from link_approvals>
   [>] <slug 2>  — active     rejections: <n>/<max>
   [ ] <slug 3>
 ```
+
+For a `waiting` chain, also print the parked goal's `needs` line from `gk status` — that is the human's unblock instruction.
 
 Plain ASCII markers `[x]` / `[>]` / `[ ]`. No emoji.
 
@@ -134,7 +140,8 @@ Plain ASCII markers `[x]` / `[>]` / `[ ]`. No emoji.
 
 ## Hard rules
 
-- **One chain at a time.** No nested or parallel chains.
+- **One chain at a time.** No nested or parallel chains. (Parallel lanes belong in worktrees.)
+- **A parked goal parks the goal, never the agent.** A human-gated blocker frees the slot via `gk park`; the agent moves to other work and a person unblocks at their own pace.
 - **Cursor only advances on judge approve** — and only via `gk verdict` / `gk advance`.
 - **Don't archive chain goals on completion.** They form a traceable history; the user can `/goal-clear` later.
 - **A missing contract aborts chain start.** Do not auto-prep mid-chain.

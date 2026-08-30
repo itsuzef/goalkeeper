@@ -17,7 +17,7 @@ Abbreviated below as `gk <command>`. Resolve `${CLAUDE_PLUGIN_ROOT}` to the goal
 
 **Never hand-write `state.json`, `active.json`, `chain.json`, or append to `log.md` with Edit/Write.** The canonical state shapes live in `scripts/gk.py` (and are asserted by `scripts/test-gk.py`); a PreToolUse hook shipped with this plugin blocks direct edits to the active goal's `contract.md`, `log.md`, and `state.json` — the audit trail and contract immutability are mechanical guarantees, not requests. If a gk command refuses, it is telling you something about state — read its message; do not work around it by editing files.
 
-Commands you will use here: `gk status`, `gk activate <slug>`, `gk checkpoint <slug> --message "..."`, `gk validate <slug>`, `gk log <slug> --compact`, `gk verdict` (via the goal-judge skill), `gk doctor` (if state ever looks inconsistent).
+Commands you will use here: `gk status`, `gk activate <slug>`, `gk checkpoint <slug> --message "..."`, `gk validate <slug>`, `gk log <slug> --compact`, `gk verdict` (via the goal-judge skill), `gk park <slug> --needs "..."` (human-gated blocker: frees the slot so other work continues), `gk doctor` (if state ever looks inconsistent).
 
 ## Execution modes
 
@@ -38,7 +38,7 @@ The Execution Loop below applies in BOTH modes — the difference is who runs it
 
 ## Status mode
 
-Run `gk status` and relay its output to the user. If it reports `NEEDS_HUMAN`, also surface the latest judge fix-list from the goal's log verbatim (`gk log <slug> --compact`) and tell the user: fix the listed items, then `/goal-resume` to continue or `/goal-clear` to abandon.
+Run `gk status` and relay its output to the user. The `Parked` section is the human's unblock queue — each entry names exactly what a person must provide and the `gk resume <slug>` that restarts it. If a goal reports `NEEDS_HUMAN`, also surface the latest judge fix-list from the goal's log verbatim (`gk log <slug> --compact`).
 
 ## Set mode
 
@@ -78,7 +78,9 @@ This block runs on activation AND on every ScheduleWakeup re-entry.
      ```
      Continue active goalkeeper goal — judge rejected the last attempt. Read the most recent "judge rejected" block via gk log <slug> --compact and address each fix-list item. Then proceed per the goal skill execution loop.
      ```
-   - **`NEEDS_HUMAN`** — max rejections reached. Stop. Do NOT schedule a wakeup. Surface the fix-list to the user verbatim and point at `/goal-resume` / `/goal-clear`.
+   - **`NEEDS_HUMAN`** — max rejections reached. gk parked the goal: the active slot is free and the need is recorded in state. Do NOT schedule a wakeup for this goal. Surface the fix-list verbatim, point at `gk resume <slug> --reset-rejections` / `/goal-clear` — then **move on to other work.** The goal is parked, not you: a human-gated stop on one goal never idles the agent.
+
+Mid-loop, if you hit a blocker only a human can clear (a credential, consent, account access, a decision that is the user's to make): `gk checkpoint` the exact blocker, then `gk park <slug> --needs "<exactly what a person must provide>"` and continue with other work. A blocker an agent could solve (missing tool, unclear code, failing environment) is work — solve it, never park it.
 
 ## Pacing wakeups
 

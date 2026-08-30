@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-30
+
+`needs_human` now parks the goal, never the agent. Previously a goal waiting on a person held the single active slot hostage — the whole repo's goal work froze until someone showed up. Now a human-gated stop frees the slot, records exactly what a person must provide, and the agent moves on to other work; the human unblocks at their own pace.
+
+### Added
+
+- **`gk park [slug] --needs "<what a person must provide>"`.** Explicit entry point for a human-gated blocker (credential, consent, account access, a decision that is the user's to make): sets `needs_human`, stamps `needs`, frees `active.json`, and moves the goal's chain (if it heads one) to a new `waiting` status. Only an `active` or `paused` goal can be parked.
+- **Parked queue in `gk status`.** Every `needs_human` goal is listed with its `needs` text and the `gk resume <slug>` that restarts it — with or without an active goal. This is the human's unblock queue.
+- **`gk resume [slug]`.** Resume now takes an optional slug so parked goals (which hold no slot) can be resumed by name. It restores the slot, clears `needs`, and re-arms a `waiting` chain whose cursor points at the resumed goal. Refused while a different goal holds the slot — one loop at a time.
+
+### Changed
+
+- **Max rejections auto-parks.** `gk verdict reject` at the cap now frees the slot (previously the goal kept it in `needs_human`). The printed outcome is still `NEEDS_HUMAN`; the recorded `needs` points at the fix-list. The explicit `--reset-rejections`/`--keep-count` choice on resume is now required only when rejections are actually on the clock — a goal parked with a zero count resumes bare.
+- **`gk chain-start` refuses over a `waiting` chain** as well as an active one (parallel lanes belong in worktrees, not overwritten chain files).
+- **Hook-guard protects parked goals.** File protection now keys on the touched goal's own state (`active`/`paused`/`needs_human`) rather than only the slot holder, so a parked goal's contract, log, state, token, and receipt stay gk-owned after the slot is freed.
+- **Skills updated** (goal, goal-chain, goal-pause, goal-resume): an executor's human-gated blocker is parked, not paused; a solvable blocker (missing tool, unclear code, validator failure) is work and is never parked; after any park the orchestrator continues with other portfolio work.
+
+### Testing
+
+- New end-to-end test (14 assertions): park frees the slot and records the need, other goals activate alongside, chain `waiting` blocks a second chain-start but survives an unrelated clear, status lists the queue, resume restores slot + chain and the resumed chain advances on approve. Updated the needs_human test to the parked semantics. 174 assertions all passing.
+
 ## [0.7.0] - 2026-08-29
 
 A verdict now leaves the building: the CLI mints a self-contained, exportable receipt at the moment it consumes a judge token, so a consumer outside the goals directory — a TaskFlow cross-flow edge, a release gate, another repository's lane — can carry and re-verify what was decided without access to goal state.

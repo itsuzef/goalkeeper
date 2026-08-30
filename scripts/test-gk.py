@@ -196,19 +196,28 @@ def test_needs_human_and_resume(tmp: Path, v: bool) -> Test:
     r = gk(proj, "verdict", "hard-goal", "reject", stdin=REJECT_RESPONSE)
     t.check("second reject prints NEEDS_HUMAN", "NEEDS_HUMAN" in r.stdout)
     state = read_json(goals / "hard-goal" / "state.json")
-    t.check("status needs_human + needs_human_at set",
-            state["status"] == "needs_human" and bool(state.get("needs_human_at")))
+    t.check("status needs_human + needs_human_at + needs set",
+            state["status"] == "needs_human"
+            and bool(state.get("needs_human_at"))
+            and bool(state.get("needs")))
     active = read_json(goals / "active.json")
-    t.check("active.json stays active-shape on needs_human",
-            active["slug"] == "hard-goal")
+    t.check("max rejections frees the active slot (parked)",
+            active["slug"] is None and active.get("ended_reason") == "parked")
 
     r = gk(proj, "resume")
-    t.check("bare resume from needs_human refused", r.returncode != 0)
-    r = gk(proj, "resume", "--reset-rejections")
+    t.check("bare resume with no slug refused, names parked goal",
+            r.returncode != 0 and "hard-goal" in r.stderr)
+    r = gk(proj, "resume", "hard-goal")
+    t.check("resume without count choice refused while rejections > 0",
+            r.returncode != 0)
+    r = gk(proj, "resume", "hard-goal", "--reset-rejections")
     t.check("resume --reset-rejections exits 0", r.returncode == 0)
     state = read_json(goals / "hard-goal" / "state.json")
-    t.check("active again with counter reset",
-            state["status"] == "active" and state["rejection_count"] == 0)
+    t.check("active again with counter reset, needs cleared",
+            state["status"] == "active" and state["rejection_count"] == 0
+            and "needs" not in state)
+    active = read_json(goals / "active.json")
+    t.check("resume restores the active slot", active["slug"] == "hard-goal")
 
     r = gk(proj, "pause")
     t.check("pause exits 0", r.returncode == 0)
@@ -217,6 +226,64 @@ def test_needs_human_and_resume(tmp: Path, v: bool) -> Test:
             and bool(state.get("paused_at")))
     r = gk(proj, "resume", "--keep-count")
     t.check("resume from paused works", r.returncode == 0)
+    return t
+
+
+def test_park_and_continue(tmp: Path, v: bool) -> Test:
+    t = Test("park frees the slot; other goals run; resume restores chain", v)
+    proj = make_project(tmp, "park")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "blocked-goal", "true")
+    write_contract(proj, "second-link", "true")
+    write_contract(proj, "other-goal", "true")
+    (proj / "chain.md").write_text(
+        "---\nname: parkchain\n---\n\n1. blocked-goal\n2. second-link\n")
+    gk(proj, "chain-start", "chain.md")
+
+    r = gk(proj, "park", "--needs", "Meta app secret from Chef")
+    t.check("park exits 0 and prints the need",
+            r.returncode == 0 and "Meta app secret" in r.stdout)
+    state = read_json(goals / "blocked-goal" / "state.json")
+    t.check("parked goal is needs_human with needs recorded",
+            state["status"] == "needs_human"
+            and state["needs"] == "Meta app secret from Chef")
+    active = read_json(goals / "active.json")
+    t.check("active slot freed",
+            active["slug"] is None and active.get("ended_reason") == "parked")
+    chain = read_json(goals / "chain.json")
+    t.check("chain moved to waiting", chain["status"] == "waiting")
+
+    r = gk(proj, "chain-start", "chain.md")
+    t.check("new chain refused over a waiting chain", r.returncode != 0)
+    r = gk(proj, "activate", "other-goal")
+    t.check("another goal activates while one is parked", r.returncode == 0)
+    r = gk(proj, "resume", "blocked-goal")
+    t.check("resume refused while another goal holds the slot",
+            r.returncode != 0)
+    r = gk(proj, "status")
+    t.check("status lists the parked goal and its need",
+            "blocked-goal" in r.stdout and "Meta app secret" in r.stdout)
+    r = gk(proj, "park", "blocked-goal", "--needs", "x")
+    t.check("re-parking a parked goal refused (only active/paused)",
+            r.returncode != 0)
+
+    gk(proj, "clear", "--yes")  # clears other-goal; waiting chain untouched
+    r = gk(proj, "resume", "blocked-goal")
+    t.check("resume without flags works when no rejections on the clock",
+            r.returncode == 0)
+    state = read_json(goals / "blocked-goal" / "state.json")
+    t.check("resumed goal active with needs cleared",
+            state["status"] == "active" and "needs" not in state)
+    chain = read_json(goals / "chain.json")
+    t.check("chain back to active", chain["status"] == "active")
+    active = read_json(goals / "active.json")
+    t.check("slot restored with chain field",
+            active["slug"] == "blocked-goal"
+            and active.get("chain") == "parkchain")
+
+    mint(proj, "blocked-goal")
+    r = gk(proj, "verdict", "blocked-goal", "approve", stdin=APPROVE_RESPONSE)
+    t.check("resumed chain advances on approve", "NEXT: second-link" in r.stdout)
     return t
 
 
@@ -798,6 +865,7 @@ def main() -> int:
     tests = [
         test_standalone_lifecycle,
         test_needs_human_and_resume,
+        test_park_and_continue,
         test_chain_lifecycle,
         test_clear_aborts_chain,
         test_baseline_capture,

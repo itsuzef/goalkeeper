@@ -25,7 +25,10 @@ Usage:
   gk advance [--fix]
   gk chain-start <chain-file>
   gk pause
-  gk resume (--reset-rejections | --keep-count)
+  gk park [slug] --needs TEXT                    (human-gated blocker: record what a
+                                                  person must provide, free the slot,
+                                                  continue with other work)
+  gk resume [slug] [--reset-rejections | --keep-count]
   gk clear --yes
   gk log <slug> [--compact] [--checkpoints N]
   gk doctor [--fix]
@@ -362,6 +365,7 @@ def cmd_status(args) -> int:
         extra = f" Last: {prev} ({term.get('ended_reason')})." if prev else ""
         print(f"No active goal.{extra} Run /goal-prep \"<rough idea>\" or "
               f"/goal \"<objective>\" to start one.")
+        _print_parked(goals)
         return 0
     state = load_state(goals, slug) or {}
     meta, _, _ = load_contract(goals, slug)
@@ -382,12 +386,15 @@ def cmd_status(args) -> int:
     print(f"Validator:   {state.get('last_validator_result')}")
     print(f"Judge:       {state.get('last_judge_verdict')}")
     print(f"Last log:    {last_log}")
-    if chain and chain.get("status") == "active":
+    if chain and chain.get("status") in ("active", "waiting"):
+        waiting = "  WAITING on a parked goal" if \
+            chain.get("status") == "waiting" else ""
         print(f"Chain:       {chain['name']}  "
-              f"[{chain['cursor']}/{len(chain['slugs'])} approved]")
+              f"[{chain['cursor']}/{len(chain['slugs'])} approved]{waiting}")
     if state.get("status") == "needs_human":
         print("\nNEEDS_HUMAN — see the latest 'judge rejected' block in "
               f"{log_path} — fix the listed items, then /goal-resume or /goal-clear.")
+    _print_parked(goals, exclude=slug)
     return 0
 
 
@@ -875,10 +882,10 @@ def cmd_verdict(args) -> int:
                f"Reasons:\n{reasons}\n\nFix-list:\n{fix_list}\n\n"
                f"Rejection count: {n}/{max_rej}")
     if n >= max_rej:
-        state["status"] = "needs_human"
-        state["needs_human_at"] = now_iso()
-        save_state(goals, slug, state)
-        append_log(goals, slug, "paused (max rejections)")
+        _park(goals, slug, state,
+              f"review the judge's fix-list ({n}/{max_rej} rejections), then "
+              f"`gk resume {slug} --reset-rejections` or `gk clear`",
+              "parked (max rejections)")
         print(f"REJECTED: {slug}  ({n}/{max_rej})")
         print("NEEDS_HUMAN")
     else:
@@ -930,8 +937,10 @@ def cmd_chain_start(args) -> int:
         if st.get("status") in ("active", "paused", "needs_human"):
             die(f"goal '{current}' is {st.get('status')} — /goal-clear first.")
     existing_chain = read_json(goals / "chain.json")
-    if existing_chain and existing_chain.get("status") == "active":
-        die(f"chain '{existing_chain.get('name')}' is active — /goal-clear first.")
+    if existing_chain and existing_chain.get("status") in ("active", "waiting"):
+        die(f"chain '{existing_chain.get('name')}' is "
+            f"{existing_chain.get('status')} — resume its parked goal or "
+            f"/goal-clear first. (Parallel lanes belong in worktrees.)")
     write_json(goals / "chain.json", {
         "name": name, "slugs": slugs, "cursor": 0, "status": "active",
         "started_at": now_iso(), "completed_at": None,
@@ -982,29 +991,126 @@ def cmd_pause(args) -> int:
     return 0
 
 
+def _park(goals: Path, slug: str, state: dict, needs: str, title: str) -> None:
+    """needs_human parks the GOAL, never the agent.
+
+    Record exactly what a person must provide, free the active slot so other
+    goals can run, and put the goal's chain (if any) into 'waiting'. The goal
+    sits in the parked queue (`gk status`) until a human unblocks it and work
+    resumes with `gk resume <slug>`.
+    """
+    state["status"] = "needs_human"
+    state["needs_human_at"] = now_iso()
+    state["needs"] = needs
+    save_state(goals, slug, state)
+    if active_info(goals) == slug:
+        write_json(goals / "active.json", {
+            "slug": None, "ended_at": now_iso(), "ended_reason": "parked",
+            "previous_slug": slug,
+        })
+    chain = read_json(goals / "chain.json")
+    if chain and chain.get("status") == "active":
+        cursor = chain.get("cursor", 0)
+        slugs = chain.get("slugs", [])
+        if cursor < len(slugs) and slugs[cursor] == slug:
+            chain["status"] = "waiting"
+            chain["waiting_since"] = now_iso()
+            write_json(goals / "chain.json", chain)
+    append_log(goals, slug, title,
+               f"Needs a human: {needs}\n"
+               f"The active slot is free — continue with other work. "
+               f"Unblock, then `gk resume {slug}`.")
+
+
+def _parked_goals(goals: Path) -> list:
+    """(slug, state) for every goal sitting in needs_human."""
+    out = []
+    for d in sorted(goals.iterdir()):
+        if not d.is_dir() or d.name in ("_archive", "shared"):
+            continue
+        st = read_json(d / "state.json")
+        if st and st.get("status") == "needs_human":
+            out.append((d.name, st))
+    return out
+
+
+def _print_parked(goals: Path, exclude: Optional[str] = None) -> None:
+    parked = [(s, st) for s, st in _parked_goals(goals) if s != exclude]
+    if not parked:
+        return
+    print("\nParked (needs a human — everything else may proceed):")
+    for s, st in parked:
+        print(f"  {s} — since {st.get('needs_human_at', '?')}")
+        print(f"    needs: {st.get('needs', 'see the goal log')}")
+        print(f"    unblock, then: gk resume {s}")
+
+
+def cmd_park(args) -> int:
+    """Park a goal on a human-gated blocker and free the active slot."""
+    goals = find_goals_dir()
+    slug = args.slug or active_info(goals)
+    if not slug:
+        die("no active goal and no slug given")
+    state = load_state(goals, slug)
+    if state is None:
+        die(f"unknown goal '{slug}'")
+    if state.get("status") not in ("active", "paused"):
+        die(f"goal '{slug}' is {state.get('status')} — only an active or "
+            f"paused goal can be parked")
+    _park(goals, slug, state, args.needs, "parked")
+    print(f"Parked goal '{slug}'.")
+    print(f"NEEDS: {args.needs}")
+    print("The active slot is free — continue with other work.")
+    return 0
+
+
 def cmd_resume(args) -> int:
     goals = find_goals_dir()
-    slug = active_info(goals)
+    active = active_info(goals)
+    slug = args.slug or active
     if not slug:
+        parked = _parked_goals(goals)
+        if parked:
+            die("no active goal — name the goal to resume: gk resume <slug>. "
+                "Parked: " + ", ".join(s for s, _ in parked))
         die("no active goal")
-    state = load_state(goals, slug) or {}
+    if active and active != slug:
+        die(f"goal '{active}' holds the active slot — one loop at a time. "
+            f"Finish, park, or clear it before resuming '{slug}'.")
+    state = load_state(goals, slug)
+    if state is None:
+        die(f"unknown goal '{slug}'")
     status = state.get("status")
     if status == "active":
         print(f"Goal '{slug}' is already active.")
         return 0
     if status == "done":
         die(f"goal '{slug}' is done — goals don't reopen. /goal-clear to archive.")
-    if status == "needs_human" and not (args.reset_rejections or args.keep_count):
-        die("resuming from needs_human requires an explicit choice: "
-            "--reset-rejections (issues fixed) or --keep-count. "
-            "The skill must ask the user first.")
+    if status == "needs_human" and state.get("rejection_count", 0) > 0 and \
+            not (args.reset_rejections or args.keep_count):
+        die("resuming from needs_human with rejections on the clock requires "
+            "an explicit choice: --reset-rejections (issues fixed) or "
+            "--keep-count. The skill must ask the user first.")
     state["status"] = "active"
     state["resumed_at"] = now_iso()
+    state.pop("needs", None)
     note = "Resumed by user."
     if args.reset_rejections:
         state["rejection_count"] = 0
         note += " Rejection counter reset."
     save_state(goals, slug, state)
+    if active != slug:
+        active_data = {"slug": slug, "activated_at": now_iso()}
+        chain = read_json(goals / "chain.json")
+        if chain and chain.get("status") == "waiting":
+            cursor = chain.get("cursor", 0)
+            slugs = chain.get("slugs", [])
+            if cursor < len(slugs) and slugs[cursor] == slug:
+                chain["status"] = "active"
+                chain.pop("waiting_since", None)
+                write_json(goals / "chain.json", chain)
+                active_data["chain"] = chain["name"]
+        write_json(goals / "active.json", active_data)
     append_log(goals, slug, "resumed", note)
     print(f"Resumed goal '{slug}'.")
     return 0
@@ -1540,12 +1646,20 @@ def cmd_hook_guard(_args) -> int:
         rel = norm[idx + len(marker):]
         if rel.startswith("_archive" + os.sep) or rel.startswith("shared" + os.sep):
             return 0
-        slug = active_info(goals)
-        if not slug:
-            return 0
-        state = read_json(goals / slug / "state.json") or {}
-        if state.get("status") not in ("active", "paused", "needs_human"):
-            return 0
+        # active.json/chain.json are gk-owned whenever any goal is live —
+        # the touched goal's own state decides everything else, so parked
+        # (needs_human) goals stay protected after the slot is freed.
+        if rel in ("active.json", "chain.json"):
+            live = active_info(goals) or next(
+                (s for s, _ in _parked_goals(goals)), None)
+            if not live:
+                return 0
+            slug = live
+        else:
+            slug = rel.split(os.sep)[0]
+            state = read_json(goals / slug / "state.json") or {}
+            if state.get("status") not in ("active", "paused", "needs_human"):
+                return 0
         protected = {
             f"{slug}{os.sep}contract.md",
             f"{slug}{os.sep}log.md",
@@ -1557,12 +1671,13 @@ def cmd_hook_guard(_args) -> int:
         }
         if rel in protected:
             print(
-                f"goalkeeper hook-guard: '{rel}' belongs to the active goal "
+                f"goalkeeper hook-guard: '{rel}' belongs to the live goal "
                 f"'{slug}' and is managed by the gk CLI — direct edits break "
                 f"the audit trail. Use `gk checkpoint`, `gk verdict`, "
-                f"`gk pause/resume/clear` (scripts/gk.py in the goalkeeper "
-                f"plugin) instead. If the contract itself is wrong, "
-                f"/goal-clear and re-prep — contracts are immutable mid-run.",
+                f"`gk pause/park/resume/clear` (scripts/gk.py in the "
+                f"goalkeeper plugin) instead. If the contract itself is "
+                f"wrong, /goal-clear and re-prep — contracts are immutable "
+                f"mid-run.",
                 file=sys.stderr,
             )
             return 2
@@ -1633,7 +1748,15 @@ def main() -> int:
     sp = sub.add_parser("pause")
     sp.set_defaults(fn=cmd_pause)
 
+    sp = sub.add_parser("park")
+    sp.add_argument("slug", nargs="?")
+    sp.add_argument("--needs", required=True,
+                    help="exactly what a person must provide "
+                         "(credential, consent, decision)")
+    sp.set_defaults(fn=cmd_park)
+
     sp = sub.add_parser("resume")
+    sp.add_argument("slug", nargs="?")
     sp.add_argument("--reset-rejections", action="store_true")
     sp.add_argument("--keep-count", action="store_true")
     sp.set_defaults(fn=cmd_resume)
