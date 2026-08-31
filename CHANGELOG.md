@@ -5,7 +5,7 @@ All notable changes to **goalkeeper** are documented here.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-08-31
 
 Goalkeeper stops being the place the rest of the system learns what happened. On 2026-08-30 a goal parked needing a person and waited 1h46m while an external monitor reported "0 stalled, 0 blocked" every 20 minutes: gk knew the exact moment it parked, and nothing outside gk could learn it, because that knowledge lived only in files other components reverse-engineered — and got wrong when v0.8.0's park-and-continue changed their shape. The correction is not a better file layout. gk now announces every state change, and its goal directory becomes private.
 
