@@ -15,6 +15,8 @@ The plugin is a set of [Claude Code skills](https://docs.claude.com/en/docs/clau
 
 All of these live under your repository's `.claude/goals/` directory and are gitignored by default (the plugin creates an opt-out `.gitignore` on first activation).
 
+**Optional, off unless you have configured it:** if a shared-kernel emission adapter is present on the machine (`OSD_KERNEL_ADAPTER`, or one of a small list of default paths), gk also appends an audit event per state transition to that **local** database — goal slug, status, rejection count, judge verdict, checkpoint text, validator output tail, chain position, and the verdict receipt. Nothing is sent anywhere; it is a local SQLite file you control. Set `GK_KERNEL_EMIT=0` to turn it off. With no adapter present — the default on any machine that has not set one up — gk writes nothing outside `.claude/`.
+
 ## What goalkeeper reads
 
 - The contract you wrote

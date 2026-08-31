@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,12 +48,21 @@ class Test:
         return passes, fails
 
 
-def gk(project: Path, *args: str, stdin: str = ""):
-    """Run gk in the project dir; return CompletedProcess."""
+def gk(project: Path, *args: str, stdin: str = "", env: dict = None):
+    """Run gk in the project dir; return CompletedProcess.
+
+    Kernel emission is off unless a case turns it on. gk discovers the emission
+    adapter from documented default paths, so a machine that happens to have
+    operation-system-design checked out would otherwise have this suite writing
+    into its real kernel. Tests do not publish.
+    """
+    child = dict(os.environ)
+    child["GK_KERNEL_EMIT"] = "0"
+    child.update(env or {})
     return subprocess.run(
         [sys.executable, str(GK), *args],
         cwd=str(project), input=stdin, capture_output=True, text=True,
-        timeout=60,
+        timeout=60, env=child,
     )
 
 
@@ -857,6 +868,411 @@ def test_verdict_receipt(tmp: Path, v: bool) -> Test:
     return t
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Kernel emission — 21-kernel-wiring-gap.md sections 5.1 and 7
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A stand-in for runtime/kernel_adapter.py. gk discovers its adapter at call
+# time and never imports one at module scope, which is exactly what makes this
+# possible: the suite proves the CALL SHAPE — which events, which payloads,
+# which condition raised and stood down — without needing operation-system-design
+# checked out next door. The real adapter is exercised separately, and only when
+# it is actually present.
+STUB_ADAPTER = '''\
+"""Recording stand-in for the emission adapter used by scripts/test-gk.py."""
+import json, os, contextlib
+
+
+class Source:
+    def __init__(self, **kw):
+        self.kw = kw
+
+
+class Freshness:
+    @staticmethod
+    def ttl(tier, horizon_hours=None):
+        return {"mode": "ttl", "tier": tier}
+
+    @staticmethod
+    def immutable():
+        return {"mode": "immutable"}
+
+
+def _log(entry):
+    with open(os.environ["GK_EMIT_LOG"], "a") as fh:
+        fh.write(json.dumps(entry) + "\\n")
+
+
+class Fold:
+    def __init__(self, actor_ref, domain_id):
+        self.actor_ref, self.domain_id = actor_ref, domain_id
+
+    def record_audit_event(self, *, event_type, subject_ref, reason, payload,
+                           **kw):
+        _log({"call": "event", "actor": self.actor_ref,
+              "domain": self.domain_id, "event_type": event_type,
+              "subject_ref": subject_ref, "reason": reason,
+              "payload": payload})
+        return "evt:stub"
+
+    def raise_condition(self, *, signal_type, subject_ref, condition_key,
+                        severity, reason, decision_owner_ref, evidence_refs,
+                        required_response_by, sources, freshness,
+                        claim_quality, **kw):
+        _log({"call": "raise", "signal_type": signal_type,
+              "subject_ref": subject_ref, "condition_key": condition_key,
+              "severity": severity, "reason": reason,
+              "decision_owner_ref": decision_owner_ref,
+              "evidence_refs": list(evidence_refs),
+              "required_response_by": required_response_by,
+              "claim_quality": claim_quality, "freshness": freshness,
+              "sources": [s.kw for s in sources]})
+        return ({}, "evt:stub")
+
+    def resolve_condition(self, *, subject_ref, condition_key, reason, sources,
+                          **kw):
+        _log({"call": "resolve", "subject_ref": subject_ref,
+              "condition_key": condition_key, "reason": reason})
+        return {}
+
+
+@contextlib.contextmanager
+def emitter(*, actor_ref, domain_id, **kw):
+    yield Fold(actor_ref, domain_id)
+'''
+
+# An adapter that imports and then fails the moment it is asked to open the
+# kernel. This is what a corrupt or unwritable database looks like through the
+# real adapter, which raises KernelUnavailable and offers no fallback.
+UNAVAILABLE_ADAPTER = '''\
+class Source:
+    def __init__(self, **kw):
+        pass
+
+
+class Freshness:
+    @staticmethod
+    def ttl(tier, horizon_hours=None):
+        return {"mode": "ttl", "tier": tier}
+
+
+def emitter(**kw):
+    raise RuntimeError("kernel unavailable at /nowhere/kernel.sqlite3")
+'''
+
+BROKEN_ADAPTER = 'raise ImportError("this adapter does not import")\n'
+
+
+def emissions(log: Path) -> list:
+    if not log.exists():
+        return []
+    return [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+
+
+def real_adapter() -> Path:
+    """The genuine runtime/kernel_adapter.py, if this machine has one."""
+    for cand in (Path.home() / "Documents" / "operation-system-design"
+                 / "runtime" / "kernel_adapter.py",
+                 Path.home() / "operation-system-design" / "runtime"
+                 / "kernel_adapter.py"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def test_kernel_emission(tmp: Path, v: bool) -> Test:
+    """21 section 7: gk announces every state change, and the announcement
+    carries what consumers used to reverse-engineer from the goal directory."""
+    t = Test("kernel emission: every transition announced, park raises a "
+             "condition, resume stands it down", v)
+    proj = make_project(tmp, "emission")
+    log = tmp / "emission.jsonl"
+    adapter = tmp / "stub_adapter.py"
+    adapter.write_text(STUB_ADAPTER)
+    env = {"GK_KERNEL_EMIT": "1", "OSD_KERNEL_ADAPTER": str(adapter),
+           "GK_EMIT_LOG": str(log)}
+    write_contract(proj, "emit-goal", "true", max_rejections=2)
+
+    gk(proj, "activate", "emit-goal", env=env)
+    gk(proj, "checkpoint", "emit-goal", "--message", "did a thing", env=env)
+    gk(proj, "validate", "emit-goal", env=env)
+    mint(proj, "emit-goal")
+    gk(proj, "verdict", "emit-goal", "reject", stdin=REJECT_RESPONSE, env=env)
+    gk(proj, "park", "emit-goal", "--needs", "Meta app secret from Chef",
+       env=env)
+    gk(proj, "resume", "emit-goal", "--keep-count", env=env)
+    mint(proj, "emit-goal")
+    gk(proj, "verdict", "emit-goal", "approve", stdin=APPROVE_RESPONSE, env=env)
+
+    calls = emissions(log)
+    events = [c for c in calls if c["call"] == "event"]
+    types = [e["event_type"] for e in events]
+    t.check("every transition emitted an audit event",
+            types == ["goal.activated", "goal.checkpointed", "goal.validated",
+                      "goal.judged", "goal.parked", "goal.resumed",
+                      "goal.judged", "goal.completed"])
+    t.check("subject is the goal, repo-qualified",
+            all(e["subject_ref"] == "gk:goal:emission:emit-goal"
+                for e in events))
+    t.check("actor is goalkeeper, domain is the shared control plane",
+            all(e["actor"] == "process:goalkeeper"
+                and e["domain"] == "kernel:shared-control" for e in events))
+    t.check("every event carries a non-empty reason",
+            all(e["reason"].strip() for e in events))
+
+    # What goal_chain_watchdog.py used to read out of active.json/state.json.
+    t.check("every payload carries slug, status and rejection_count",
+            all({"slug", "status", "rejection_count"} <= set(e["payload"])
+                for e in events))
+    parked = next(e for e in events if e["event_type"] == "goal.parked")
+    t.check("the park event carries what a person must provide",
+            parked["payload"]["needs"] == "Meta app secret from Chef"
+            and parked["payload"]["to_status"] == "needs_human"
+            and parked["payload"]["freed_active_slot"] is True)
+    t.check("the park event carries the exact instant, not a file mtime",
+            bool(parked["payload"]["status"]) and
+            parked["payload"]["from_status"] == "active")
+    # What cross_flow_relay.py used to read out of receipt.json.
+    approved = [e for e in events if e["event_type"] == "goal.judged"][-1]
+    receipt = approved["payload"]["receipt"]
+    t.check("the judged event carries the whole verdict receipt inline",
+            receipt is not None and receipt["decision"] == "approve"
+            and receipt["gate_quality"] is True
+            and bool(receipt["contract_sha256"])
+            and receipt["repo"]["head"] is not None)
+    t.check("the judged event carries the judge mode and consumed token",
+            approved["payload"]["judge_mode"] == "subagent"
+            and bool(approved["payload"]["token_id"]))
+    rejected = [e for e in events if e["event_type"] == "goal.judged"][0]
+    t.check("a rejection carries its fix-list",
+            "Create the marker file" in (rejected["payload"]["fix_list"] or ""))
+
+    raises = [c for c in calls if c["call"] == "raise"]
+    resolves = [c for c in calls if c["call"] == "resolve"]
+    t.check("parking raises exactly one condition", len(raises) == 1)
+    r = raises[0]
+    t.check("the condition names a human decision owner",
+            r["decision_owner_ref"] == "actor:chef")
+    t.check("the condition key is stable across signal type and severity",
+            r["condition_key"] == "goalkeeper-awaiting-human"
+            and "hard" not in r["condition_key"]
+            and "attention" not in r["condition_key"])
+    t.check("the condition is evidenced, decays on a live clock, and claims "
+            "only what gk observed",
+            r["evidence_refs"] == ["gk:goal:emission:emit-goal"]
+            and r["freshness"] == {"mode": "ttl", "tier": "live"}
+            and r["claim_quality"] == "observed"
+            and r["sources"][0]["source_type"] == "application")
+    t.check("gk invents no response deadline it does not know",
+            r["required_response_by"] is None)
+    t.check("resuming stands the condition down on the same key",
+            len(resolves) == 1
+            and resolves[0]["condition_key"] == "goalkeeper-awaiting-human")
+
+    # A different park path is a different condition, on the same stable key.
+    proj2 = make_project(tmp, "emission2")
+    log2 = tmp / "emission2.jsonl"
+    env2 = dict(env, GK_EMIT_LOG=str(log2))
+    write_contract(proj2, "doomed", "true", max_rejections=1)
+    gk(proj2, "activate", "doomed", env=env2)
+    mint(proj2, "doomed")
+    gk(proj2, "verdict", "doomed", "reject", stdin=REJECT_RESPONSE, env=env2)
+    r2 = [c for c in emissions(log2) if c["call"] == "raise"]
+    t.check("max-rejections park raises validation_failed, not a generic stall",
+            len(r2) == 1 and r2[0]["signal_type"] == "validation_failed"
+            and r2[0]["condition_key"] == "goalkeeper-awaiting-human")
+
+    # The mission layer escalates to a person too, and says so.
+    proj3 = make_project(tmp, "emission3")
+    log3 = tmp / "emission3.jsonl"
+    env3 = dict(env, GK_EMIT_LOG=str(log3))
+    (proj3 / ".claude" / "mission.md").write_text(
+        "# Mission: emit-mission\n\n## Objective\nShip it.\n")
+    gk(proj3, "mission-init", env=env3)
+    gk(proj3, "mission-verdict", "escalate", env=env3, stdin=(
+        "VERDICT: escalate\n\nREASONING:\nThe charter is inconsistent.\n\n"
+        "ESCALATION:\nDecide which of the two success conditions binds.\n"))
+    gk(proj3, "mission-resume", "--note", "resolved", env=env3)
+    mcalls = emissions(log3)
+    mtypes = [c["event_type"] for c in mcalls if c["call"] == "event"]
+    t.check("mission transitions announce too",
+            mtypes == ["mission.initialized", "mission.verdict",
+                       "mission.resumed"])
+    t.check("an escalated mission raises and then stands down the same "
+            "human-gated condition",
+            [c["call"] for c in mcalls if c["call"] in ("raise", "resolve")]
+            == ["raise", "resolve"])
+    return t
+
+
+# Two runs of one lifecycle differ in three ways that have nothing to do with
+# the kernel: the instant, the throwaway repo (path and commit sha), and the
+# randomly minted judge-token ids. Blank exactly those. Everything else must
+# match byte for byte, or emission changed gk's behaviour.
+NOISE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|\d{8}-\d{6}|\b[0-9a-f]{7,64}\b")
+
+
+def _normalize(text: str, proj: Path) -> str:
+    for form in (str(proj.resolve()), str(proj)):
+        text = text.replace(form, "<proj>")
+    return NOISE.sub("<stamp>", text)
+
+
+def _fingerprint(proj: Path, goals: Path) -> str:
+    """Every gk-owned byte, normalized."""
+    out = []
+    for path in sorted(p for p in goals.rglob("*") if p.is_file()):
+        out.append(f"--- {path.relative_to(proj)}")
+        out.append(_normalize(path.read_text(), proj))
+    return "\n".join(out)
+
+
+def _run_lifecycle(proj: Path, env: dict) -> str:
+    """One fixed lifecycle. Returns stdout+exit codes, the observable surface."""
+    write_contract(proj, "same-goal", "test -f marker.txt", max_rejections=2)
+    transcript = []
+
+    def step(*args, stdin=""):
+        r = gk(proj, *args, stdin=stdin, env=env)
+        transcript.append(f"$ gk {' '.join(args)}\n[{r.returncode}]\n{r.stdout}")
+
+    step("activate", "same-goal")
+    step("checkpoint", "same-goal", "--message", "did a thing")
+    step("validate", "same-goal")
+    (proj / "marker.txt").write_text("done\n")
+    step("validate", "same-goal")
+    step("judge-brief", "same-goal")
+    step("verdict", "same-goal", "reject", stdin=REJECT_RESPONSE)
+    step("park", "same-goal", "--needs", "a person must decide")
+    step("status")
+    step("status", "--json")
+    step("resume", "same-goal", "--keep-count")
+    step("judge-brief", "same-goal")
+    step("verdict", "same-goal", "approve", stdin=APPROVE_RESPONSE)
+    step("status")
+    return _normalize("\n".join(transcript), proj)
+
+
+def test_kernel_absence_changes_nothing(tmp: Path, v: bool) -> Test:
+    """gk runs in fresh clones, worktrees, and other people's checkouts.
+
+    The emission adapter has no best-effort mode on purpose — a runtime
+    component that cannot record a signal must stop. gk is the opposite case and
+    must be genuinely best-effort: a missing or broken kernel may not block,
+    fail, or refuse a state change. The proof is a diff, not a promise.
+    """
+    t = Test("kernel absence and corruption leave gk's behaviour unchanged", v)
+    baseline_proj = make_project(tmp, "beh-off")
+    baseline = _run_lifecycle(baseline_proj, {"GK_KERNEL_EMIT": "0"})
+    baseline_files = _fingerprint(baseline_proj,
+                                  baseline_proj / ".claude" / "goals")
+
+    missing = tmp / "no-such-dir" / "kernel_adapter.py"
+    broken = tmp / "broken_adapter.py"
+    broken.write_text(BROKEN_ADAPTER)
+    unavailable = tmp / "unavailable_adapter.py"
+    unavailable.write_text(UNAVAILABLE_ADAPTER)
+
+    cases = [
+        ("adapter absent", {"GK_KERNEL_EMIT": "1",
+                            "OSD_KERNEL_ADAPTER": str(missing)}),
+        ("adapter corrupt (fails to import)",
+         {"GK_KERNEL_EMIT": "1", "OSD_KERNEL_ADAPTER": str(broken)}),
+        ("kernel unavailable (adapter raises on open)",
+         {"GK_KERNEL_EMIT": "1", "OSD_KERNEL_ADAPTER": str(unavailable)}),
+    ]
+    real = real_adapter()
+    if real:
+        # The genuine adapter over a file that is not a database. This is the
+        # 2026-08-30 failure's evil twin: the kernel is there and unreadable.
+        corrupt_db = tmp / "corrupt-kernel.sqlite3"
+        corrupt_db.write_bytes(b"this is not a database\x00\x01\x02")
+        cases.append(("real adapter, corrupt kernel database",
+                      {"GK_KERNEL_EMIT": "1", "OSD_KERNEL_ADAPTER": str(real),
+                       "OSD_KERNEL_DB": str(corrupt_db)}))
+
+    for i, (label, env) in enumerate(cases):
+        proj = make_project(tmp, f"beh-{i}")
+        transcript = _run_lifecycle(proj, env)
+        files = _fingerprint(proj, proj / ".claude" / "goals")
+        t.check(f"{label}: stdout and exit codes identical",
+                transcript == baseline)
+        t.check(f"{label}: every gk-owned file identical",
+                files == baseline_files)
+
+    # Failures are visible, not silent — one line on stderr, never an exception.
+    proj = make_project(tmp, "beh-stderr")
+    write_contract(proj, "noisy", "true")
+    r = gk(proj, "activate", "noisy",
+           env={"GK_KERNEL_EMIT": "1", "OSD_KERNEL_ADAPTER": str(broken)})
+    t.check("a broken kernel is reported on stderr and exits 0",
+            r.returncode == 0 and "kernel emission skipped" in r.stderr
+            and "Activated goal" in r.stdout)
+    t.check("no traceback reaches the caller",
+            "Traceback" not in r.stderr)
+    r = gk(proj, "checkpoint", "noisy", "--message", "quiet",
+           env={"GK_KERNEL_EMIT": "1",
+                "OSD_KERNEL_ADAPTER": str(tmp / "beh-off")})
+    t.check("a directory with no kernel_adapter.py is a quiet no-op path, "
+            "still exit 0", r.returncode == 0)
+    if real:
+        t.check("the real adapter was exercised against a corrupt kernel", True)
+    else:
+        t.check("real adapter not on this machine — stub cases only "
+                "(the corrupt-database case did not run)", True)
+    return t
+
+
+def test_status_json_is_not_poorer_than_the_text(tmp: Path, v: bool) -> Test:
+    """21 section 3: `gk status --json` dumped four raw files and returned
+    above the parked derivation the text path performs, so a parked goal
+    reported `"state": null` to a machine while printing the queue to a human.
+    One derivation, two renderings (section 5.1)."""
+    t = Test("status: one derivation, two renderings", v)
+    proj = make_project(tmp, "statusmodel")
+    goals = proj / ".claude" / "goals"
+    write_contract(proj, "watched", "true")
+    gk(proj, "activate", "watched")
+
+    model = json.loads(gk(proj, "status", "--json").stdout)
+    t.check("json names the active goal and its status",
+            model["slug"] == "watched" and model["status"] == "active"
+            and model["goal"]["objective"].startswith("Test objective"))
+    t.check("json still carries the four raw files under their old keys",
+            model["active"]["slug"] == "watched"
+            and model["state"]["status"] == "active"
+            and "chain" in model and "mission" in model)
+    t.check("nothing is parked yet",
+            model["needs_human"] is False and model["parked"] == [])
+
+    gk(proj, "park", "--needs", "the credential only a person has")
+    text = gk(proj, "status").stdout
+    model = json.loads(gk(proj, "status", "--json").stdout)
+    t.check("the human surface shows the parked queue",
+            "watched" in text and "the credential only a person has" in text)
+    t.check("the machine surface shows it too — this is the defect",
+            model["needs_human"] is True
+            and [p["slug"] for p in model["parked"]] == ["watched"]
+            and model["parked"][0]["needs"]
+            == "the credential only a person has"
+            and bool(model["parked"][0]["needs_human_at"]))
+    t.check("a parked goal holds no slot, and json says so honestly",
+            model["slug"] is None and model["status"] is None
+            and model["active"]["ended_reason"] == "parked")
+
+    # A half-built goal dir must not take status down; it is a diagnostic.
+    (goals / "watched" / "contract.md").unlink()
+    gk(proj, "resume", "watched")
+    r = gk(proj, "status")
+    t.check("status survives a missing contract for the active goal",
+            r.returncode == 0 and "Objective:   —" in r.stdout)
+    r = gk(proj, "status", "--json")
+    t.check("so does --json", r.returncode == 0
+            and json.loads(r.stdout)["goal"]["objective"] is None)
+    return t
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
@@ -879,6 +1295,9 @@ def main() -> int:
         test_mission_fresh_init,
         test_mission_escalate_and_recovery,
         test_mission_hook_guard,
+        test_status_json_is_not_poorer_than_the_text,
+        test_kernel_emission,
+        test_kernel_absence_changes_nothing,
     ]
     total_pass = total_fail = 0
     print("gk end-to-end suite\n")

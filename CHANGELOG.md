@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Goalkeeper stops being the place the rest of the system learns what happened. On 2026-08-30 a goal parked needing a person and waited 1h46m while an external monitor reported "0 stalled, 0 blocked" every 20 minutes: gk knew the exact moment it parked, and nothing outside gk could learn it, because that knowledge lived only in files other components reverse-engineered — and got wrong when v0.8.0's park-and-continue changed their shape. The correction is not a better file layout. gk now announces every state change, and its goal directory becomes private.
+
+### Added
+
+- **Kernel transition events.** Every state change — activate, checkpoint, validate, judge verdict, chain start/advance/complete/abort, pause, park, resume, clear, `doctor --fix` repair, and every mission transition — emits an append-only audit event to a shared kernel when an emission adapter is present. The payload carries what outside readers used to dig out of `active.json`/`state.json`/`chain.json`/`receipt.json`: slug, status, from/to status, rejection count, last judge verdict and mode, chain position and approvals, the checkpoint text, the validator result, and the whole verdict receipt inline on a judged event. gk deliberately owns **no** kernel projection — its state machine stays domain-internal, and two sources of truth cannot drift if only one exists.
+- **A raised condition when a person is the blocker.** Parking a goal raises one live kernel condition naming the decision owner (`GK_DECISION_OWNER`, default `actor:chef`), with the goal's `needs` text and a live-tier freshness policy; resuming or clearing stands it down. Max-rejection parks raise `validation_failed`, human-gated parks `hard_dependency_broken`, both on one stable condition key so they never accumulate. An escalated mission raises the same condition. gk sets no response deadline it does not know.
+- **Genuinely best-effort emission.** The adapter is discovered at call time (`OSD_KERNEL_ADAPTER`, else documented defaults) and never imported as a dependency. Not found: silent no-op. Broken, unavailable, or corrupt: one line on stderr and gk continues — never an exception, never a non-zero exit, never a refused transition. gk runs in fresh clones, worktrees, and machines with no kernel, and failing closed on infrastructure it does not own would be worse than the problem being fixed. `GK_KERNEL_EMIT=0` turns it off.
+
+### Fixed
+
+- **`gk status --json` was strictly less informative than `gk status`.** `cmd_status` dumped four raw files and returned *above* the parked derivation the text path performs, so a parked goal reported `"state": null` to a machine while printing the queue correctly to a human — and every feature added below that early return was invisible to machines by default. Status is now one derived model with two renderings: the JSON carries `slug`, `status`, a `needs_human` flag, the full parked queue with each goal's `needs` and `needs_human_at`, the goal's contract-relative rejection budget and last log line, plus the four raw files unchanged under their original keys.
+- **`gk status` no longer dies on a missing contract** for the active goal, and neither does `--json`. Status is a read-only diagnostic; it has to survive a half-built goal directory.
+- **A contract with `validator.command: true` crashed gk.** The frontmatter scalar coercion turned the shell word into a Python bool and `subprocess.run` raised `TypeError`. A no-op validator is legitimate; the shell gets its word back.
+
+### Testing
+
+- 33 new assertions: emission call-shape against a recording stand-in adapter (event types and order, subject, actor, payload contents, receipt inline, condition raised/stood down, mission escalation), and a behavioural-equivalence suite that runs one fixed lifecycle with the kernel absent, un-importable, unavailable, and — when the real adapter is on the machine — genuinely corrupt, diffing every gk-owned byte and every line of stdout and every exit code against a run with emission off. 213 assertions all passing.
+
 ## [0.8.0] - 2026-08-30
 
 `needs_human` now parks the goal, never the agent. Previously a goal waiting on a person held the single active slot hostage — the whole repo's goal work froze until someone showed up. Now a human-gated stop frees the slot, records exactly what a person must provide, and the agent moves on to other work; the human unblocks at their own pace.

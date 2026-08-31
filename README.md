@@ -326,6 +326,31 @@ All skills read and write the same shapes via gk. Single source of truth is `scr
 
 **`chain.json`** — `name`, `slugs[]`, `cursor`, `status`, `started_at`, `completed_at`, `source_file`, `link_approvals[]`. The `link_approvals` array accumulates `{slug, approved_at}` entries as each link is judge-approved, providing chain-level visibility independent of per-link state files.
 
+### The goal directory is private
+
+The shapes above are documented so you can read them, not so another program can. **They are goalkeeper's working files, not an integration surface** — v0.8.0's park-and-continue changed `active.json` in a way that silently broke an external monitor built on reading them, and that monitor then reported everything fine for 1h46m while a goal sat waiting for a person. A file layout that other components reverse-engineer will do that again.
+
+Two supported ways to ask goalkeeper what is true:
+
+- **`gk status --json`** — one derived model, the same one `gk status` renders for a human. It carries the active goal, its contract-relative rejection budget, the parked queue with each goal's `needs` text, a top-level `needs_human` flag, and the four raw files under their original keys. Nothing the text output shows is missing from the JSON.
+- **Kernel events** — see below.
+
+### Kernel emission (optional)
+
+If a shared-kernel emission adapter is present (a module exposing `emitter()`, `Source`, and `Freshness` — discovered at call time, never imported as a dependency), gk announces every state change to it: an append-only audit event on activate, checkpoint, validate, judge verdict, chain start/advance/complete/abort, pause, park, resume, clear, doctor repair, and every mission transition. Each event's payload carries what an outside reader used to dig out of the goal directory — status, rejection count, last judge verdict, chain position, and the full verdict receipt on a judged event. Deleting goalkeeper leaves that history intact.
+
+When a goal parks (or a mission escalates), gk additionally raises **one live condition** naming the person who must act, and stands it down when the goal is resumed or cleared. That is the thing a human actually has to see, and the thing a file-reading monitor could not learn.
+
+**This is strictly best-effort and can never affect a goal.** gk runs in fresh clones, worktrees, and machines that have no kernel at all. No adapter found → silent no-op. Adapter or kernel broken → one line on stderr and gk carries on: never an exception, never a non-zero exit, never a refused transition. The end-to-end suite proves it by running the same lifecycle with the kernel absent, un-importable, unavailable, and corrupt, and diffing every gk-owned byte and every line of output against a run with emission off.
+
+| Variable | Effect |
+| --- | --- |
+| `OSD_KERNEL_ADAPTER` | Path to the emission adapter (or its directory). Unset: a short list of documented default paths is tried, then gk goes quiet. |
+| `GK_KERNEL_EMIT=0` | Turn emission off entirely. |
+| `GK_DECISION_OWNER` | Actor reference a raised condition is routed to. Default `actor:chef`. |
+| `GK_KERNEL_DOMAIN` | Kernel domain id. Default `kernel:shared-control`. |
+| `GK_KERNEL_ACTOR` | Overrides the emitting actor reference (default `process:goalkeeper`). Distinct from `GK_ACTOR`, which names the executing agent in `state.json`. |
+
 ## Design notes
 
 - **The contract is the spec.** Bad contracts produce bad work. `/goal-prep` is mandatory because thin contracts are goalkeeper's #1 failure mode.

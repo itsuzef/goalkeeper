@@ -38,6 +38,20 @@ Usage:
   gk mission-verdict proceed|done|escalate       (supervisor's structured response on stdin)
   gk mission-resume [--note TEXT]                (escalated → active, after the user resolves)
   gk hook-guard                                  (PreToolUse JSON on stdin)
+
+Every transition also emits a kernel audit event, and a park raises a kernel
+condition naming the person who must act — best-effort, never blocking. See the
+"Kernel emission" section below. Environment:
+
+  OSD_KERNEL_ADAPTER   path to runtime/kernel_adapter.py (else documented
+                       defaults; not found = silent no-op)
+  GK_KERNEL_EMIT=0     turn emission off entirely
+  GK_DECISION_OWNER    actor ref a raised condition is routed to (default
+                       actor:chef)
+  GK_KERNEL_DOMAIN     kernel domain id (default kernel:shared-control)
+  GK_KERNEL_ACTOR      overrides the emitting actor ref (default
+                       process:goalkeeper); distinct from GK_ACTOR, which
+                       names the executing agent in state.json
 """
 
 from __future__ import annotations
@@ -259,6 +273,13 @@ def run_validator(root: Path, meta: dict):
     cmd = validator.get("command")
     if not cmd:
         return "not_runnable", "contract has no validator.command"
+    # `command: true` is a legitimate no-op validator, and the frontmatter
+    # scalar coercion turns it into the Python bool. Hand the shell back the
+    # word it was written as rather than a TypeError from subprocess.
+    if isinstance(cmd, bool):
+        cmd = "true" if cmd else "false"
+    elif not isinstance(cmd, str):
+        cmd = str(cmd)
     timeout = validator.get("timeout_seconds") or 600
     success = validator.get("success") or "exit_zero"
     try:
@@ -339,62 +360,449 @@ def compact_log(log_text: str, keep_checkpoints: int = 5) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Kernel emission — the outbound half of the goal directory
+#
+# 21-kernel-wiring-gap.md section 7: "Goalkeeper emits a kernel transition event
+# on every state change, and stores nothing that another component is expected to
+# read." On 2026-08-30 a goal parked at 15:25:02Z and waited 1h46m while a
+# watchdog reported "0 stalled, 0 blocked" every 20 minutes, because the only
+# record of the park was `.claude/goals/*.json` — files other components
+# reverse-engineered and got wrong when v0.8.0 changed their shape. The
+# correction is not a better file layout. It is that gk announces, and consumers
+# read the announcement instead of the files.
+#
+# What crosses to the kernel, and what deliberately does not:
+#
+#   * An audit EVENT on every state change, subject = the goal. gk does NOT own
+#     or update an Initiative projection. Its state machine is domain-internal:
+#     mirroring it into a kernel record would create two sources of truth that
+#     drift, and `put_record` commits its own transaction, so a transition event
+#     and a projection update cannot be made atomic from out here anyway.
+#   * A raised CONDITION when a goal reaches a state that needs a person. That
+#     is the thing a human must actually see, and the thing that failed on
+#     2026-08-30. It is resolved when the goal is unblocked.
+#
+# BEST-EFFORT, AND DELIBERATELY THE OPPOSITE OF THE ADAPTER'S DEFAULT.
+# runtime/kernel_adapter.py has no best-effort mode on purpose: a runtime
+# component that cannot record a signal must stop. gk is the opposite case. It
+# runs in fresh clones, worktrees, other people's checkouts, and machines where
+# the kernel does not exist at all. A missing or broken kernel must never block,
+# fail, or refuse a gk state change — gk is a state machine that has to keep
+# working when it cannot phone home, and failing closed on infrastructure it does
+# not own would be worse than the problem being fixed. So every emission failure
+# is swallowed and surfaced as one line on stderr: never an exception, never a
+# non-zero exit, never a refused transition.
+#
+# The adapter is therefore discovered at CALL time and never imported at module
+# scope: `OSD_KERNEL_ADAPTER`, else a small list of documented default paths.
+# Not found → silent no-op. Found but broken → one stderr line, and gk continues.
+# ─────────────────────────────────────────────────────────────────────────────
+
+KERNEL_ADAPTER_ENV = "OSD_KERNEL_ADAPTER"
+KERNEL_EMIT_ENV = "GK_KERNEL_EMIT"
+KERNEL_DECISION_OWNER_ENV = "GK_DECISION_OWNER"
+KERNEL_DOMAIN_ENV = "GK_KERNEL_DOMAIN"
+# Deliberately NOT GK_ACTOR: that one names the executing agent for the
+# activation-time `executor` observables, and a harness setting it must not
+# silently rewrite who the kernel records as the writer.
+KERNEL_ACTOR_ENV = "GK_KERNEL_ACTOR"
+
+KERNEL_ADAPTER_DEFAULTS = (
+    "~/Documents/operation-system-design/runtime/kernel_adapter.py",
+    "~/operation-system-design/runtime/kernel_adapter.py",
+)
+KERNEL_ACTOR = "process:goalkeeper"
+KERNEL_DOMAIN = "kernel:shared-control"
+KERNEL_DECISION_OWNER = "actor:chef"
+
+# One live Signal per goal, per 02 section 5.15: the key excludes signal type and
+# severity so both may change without splitting the condition in two.
+NEEDS_HUMAN_CONDITION = "goalkeeper-awaiting-human"
+
+# A checkpoint message is audit content, not a pointer at one — the log stops
+# being an integration surface, so the event has to carry the text. Capped
+# because a checkpoint is occasionally a pasted validator dump.
+EMIT_TEXT_CAP = 4000
+
+_GK_VERSION: Optional[str] = None
+
+
+def gk_version() -> str:
+    """Plugin version, read from the manifest so there is one place to bump."""
+    global _GK_VERSION
+    if _GK_VERSION is None:
+        meta = read_json(Path(__file__).resolve().parents[1]
+                         / ".claude-plugin" / "plugin.json") or {}
+        _GK_VERSION = str(meta.get("version") or "unknown")
+    return _GK_VERSION
+
+
+def _emission_enabled() -> bool:
+    return os.environ.get(KERNEL_EMIT_ENV, "").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+def _kernel_adapter_path(goals: Path):
+    """(path, explicit) — where the adapter is, and whether a human said so.
+
+    An explicit `OSD_KERNEL_ADAPTER` that does not resolve is a misconfiguration
+    and earns the stderr line; a plain absence is the normal case on most
+    machines and stays silent.
+    """
+    override = os.environ.get(KERNEL_ADAPTER_ENV, "").strip()
+    if override:
+        cand = Path(override).expanduser()
+        if cand.is_dir():
+            cand = cand / "kernel_adapter.py"
+        return (cand if cand.is_file() else None), True
+    root = project_root(goals)
+    candidates = [root.parent / "operation-system-design" / "runtime"
+                  / "kernel_adapter.py"]
+    candidates += [Path(p).expanduser() for p in KERNEL_ADAPTER_DEFAULTS]
+    for cand in candidates:
+        if cand.is_file():
+            return cand, False
+    return None, False
+
+
+def _import_adapter(path: Path):
+    import importlib.util
+    name = "gk_kernel_adapter"
+    existing = sys.modules.get(name)
+    origin = getattr(existing, "__file__", None) if existing else None
+    if origin and Path(origin).resolve() == path.resolve():
+        return existing
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"no loader for {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _kernel_note(detail: str) -> None:
+    print(f"gk: kernel emission skipped ({detail}) — the state change is "
+          f"recorded on disk and gk continues", file=sys.stderr)
+
+
+def _with_kernel(goals: Path, action) -> None:
+    """Run `action(adapter, fold)` against the kernel, or don't. Never raises.
+
+    KeyboardInterrupt is the one thing that still propagates: a caller pressing
+    ctrl-c is not an emission failure.
+    """
+    if not _emission_enabled():
+        return
+    path, explicit = _kernel_adapter_path(goals)
+    if path is None:
+        if explicit:
+            _kernel_note(f"{KERNEL_ADAPTER_ENV} does not name a readable "
+                         f"kernel_adapter.py")
+        return
+    try:
+        adapter = _import_adapter(path)
+        with adapter.emitter(
+            actor_ref=os.environ.get(KERNEL_ACTOR_ENV) or KERNEL_ACTOR,
+            domain_id=os.environ.get(KERNEL_DOMAIN_ENV) or KERNEL_DOMAIN,
+        ) as fold:
+            action(adapter, fold)
+    except KeyboardInterrupt:
+        raise
+    except (Exception, SystemExit) as exc:  # a rogue adapter may even sys.exit
+        _kernel_note(f"{type(exc).__name__}: {exc}")
+
+
+def goal_ref(goals: Path, slug: str) -> str:
+    """Stable kernel subject for a goal. Repo-qualified: two checkouts may hold
+    the same slug, and a Signal deduplicates on (subject_ref, condition_key)."""
+    return f"gk:goal:{project_root(goals).name}:{slug}"
+
+
+def _chain_summary(chain: Optional[dict]) -> Optional[dict]:
+    if not chain:
+        return None
+    slugs = chain.get("slugs") or []
+    return {
+        "name": chain.get("name"),
+        "status": chain.get("status"),
+        "cursor": chain.get("cursor"),
+        "total": len(slugs),
+        "slugs": slugs,
+        "link_approvals": chain.get("link_approvals") or [],
+        "waiting_since": chain.get("waiting_since"),
+    }
+
+
+def _emit_payload(goals: Path, slug: str, state: Optional[dict] = None,
+                  extra: Optional[dict] = None) -> dict:
+    """Everything an outside reader used to reverse-engineer from the files.
+
+    `goal_chain_watchdog.py` read active.json's slug plus state.json's status,
+    rejection_count and last_judge_verdict, and derived idleness from file
+    mtimes. `cross_flow_relay.py` read receipt.json. All of it is here, on every
+    event, so neither has to open a goal directory again.
+    """
+    if state is None:
+        state = load_state(goals, slug) or {}
+    payload = {
+        "slug": slug,
+        "goal_ref": goal_ref(goals, slug),
+        "repo_root": str(project_root(goals)),
+        "gk_version": gk_version(),
+        "status": state.get("status"),
+        "rejection_count": state.get("rejection_count"),
+        "started_at": state.get("started_at"),
+        "started_at_commit": state.get("started_at_commit"),
+        "last_checkpoint_at": state.get("last_checkpoint_at"),
+        "last_validator_result": state.get("last_validator_result"),
+        "last_judge_verdict": state.get("last_judge_verdict"),
+        "last_judge_mode": state.get("last_judge_mode"),
+        "chain_step": state.get("chain_step"),
+        "needs": state.get("needs"),
+        "chain": _chain_summary(read_json(goals / "chain.json")),
+    }
+    payload.update(extra or {})
+    return payload
+
+
+def _sources(adapter, goals: Path, slug: str):
+    return [adapter.Source(
+        source_type="application",
+        locator=f"gk:{project_root(goals)}/.claude/goals/{slug}",
+        authority_scope="goalkeeper goal lifecycle",
+        version_or_hash=f"goalkeeper-{gk_version()}",
+        retention_rule="retain until the goal closes",
+    )]
+
+
+def emit_goal_event(goals: Path, slug: str, event_type: str, reason: str,
+                    extra: Optional[dict] = None,
+                    state: Optional[dict] = None,
+                    escalate: Optional[dict] = None,
+                    stand_down: Optional[str] = None) -> None:
+    """One audit event, plus the human-gated condition when there is one.
+
+    `escalate` raises (or updates) the live Signal for this goal;
+    `stand_down` resolves it. Both are optional and both go through the same
+    best-effort wrapper as the event: a goal still parks, and still resumes,
+    when the kernel is not there.
+    """
+    payload = _emit_payload(goals, slug, state=state, extra=extra)
+    subject = payload["goal_ref"]
+
+    def action(adapter, fold):
+        fold.record_audit_event(event_type=event_type, subject_ref=subject,
+                                reason=reason, payload=payload)
+        if escalate:
+            fold.raise_condition(
+                signal_type=escalate["signal_type"],
+                subject_ref=subject,
+                condition_key=NEEDS_HUMAN_CONDITION,
+                severity=escalate.get("severity", "attention"),
+                reason=escalate["reason"],
+                decision_owner_ref=os.environ.get(KERNEL_DECISION_OWNER_ENV)
+                or KERNEL_DECISION_OWNER,
+                evidence_refs=[subject],
+                # gk knows of no deadline here and declines to invent one. The
+                # condition is still live in the fold (`open_signals`); it simply
+                # joins no due-by queue. 21 section 6.2 leaves that horizon an
+                # owner decision.
+                required_response_by=None,
+                sources=_sources(adapter, goals, slug),
+                freshness=adapter.Freshness.ttl("live"),
+                claim_quality="observed",
+            )
+        if stand_down:
+            fold.resolve_condition(
+                subject_ref=subject,
+                condition_key=NEEDS_HUMAN_CONDITION,
+                reason=stand_down,
+                sources=_sources(adapter, goals, slug),
+            )
+
+    _with_kernel(goals, action)
+
+
+def emit_mission_event(goals: Path, mission: dict, event_type: str,
+                       reason: str, extra: Optional[dict] = None,
+                       escalate: Optional[dict] = None,
+                       stand_down: Optional[str] = None) -> None:
+    """The mission layer's transitions, on the same terms as a goal's.
+
+    An escalated mission is a person-shaped stop exactly like a parked goal, and
+    leaving it invisible would reproduce the 2026-08-30 failure one level up.
+    """
+    name = mission.get("name") or "unnamed-mission"
+    subject = f"gk:mission:{project_root(goals).name}:{name}"
+    payload = {
+        "mission": name,
+        "mission_ref": subject,
+        "repo_root": str(project_root(goals)),
+        "gk_version": gk_version(),
+        "status": mission.get("status"),
+        "started_at": mission.get("started_at"),
+        "goals_completed": mission.get("goals_completed") or [],
+        "supervisor_verdicts": mission.get("supervisor_verdicts") or [],
+    }
+    payload.update(extra or {})
+
+    def action(adapter, fold):
+        fold.record_audit_event(event_type=event_type, subject_ref=subject,
+                                reason=reason, payload=payload)
+        sources = [adapter.Source(
+            source_type="application",
+            locator=f"gk:{project_root(goals)}/.claude/mission.json",
+            authority_scope="goalkeeper mission supervision",
+            version_or_hash=f"goalkeeper-{gk_version()}",
+            retention_rule="retain until the mission closes",
+        )]
+        if escalate:
+            fold.raise_condition(
+                signal_type=escalate["signal_type"],
+                subject_ref=subject,
+                condition_key=NEEDS_HUMAN_CONDITION,
+                severity=escalate.get("severity", "attention"),
+                reason=escalate["reason"],
+                decision_owner_ref=os.environ.get(KERNEL_DECISION_OWNER_ENV)
+                or KERNEL_DECISION_OWNER,
+                evidence_refs=[subject],
+                required_response_by=None,
+                sources=sources,
+                freshness=adapter.Freshness.ttl("live"),
+                claim_quality="observed",
+            )
+        if stand_down:
+            fold.resolve_condition(subject_ref=subject,
+                                   condition_key=NEEDS_HUMAN_CONDITION,
+                                   reason=stand_down, sources=sources)
+
+    _with_kernel(goals, action)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────────────────────────────────────
 
+def contract_meta(goals: Path, slug: str) -> dict:
+    """Frontmatter if there is any. Unlike load_contract this never dies —
+    status is a read-only diagnostic and must survive a half-built goal dir."""
+    path = goals / slug / "contract.md"
+    if not path.is_file():
+        return {}
+    meta, _ = parse_frontmatter(path.read_text())
+    return meta
+
+
+def last_log_line(goals: Path, slug: str) -> str:
+    log_path = goals / slug / "log.md"
+    if not log_path.is_file():
+        return "—"
+    _, blocks = split_log_blocks(log_path.read_text())
+    if not blocks:
+        return "—"
+    title, body = blocks[-1]
+    first = next((l for l in body.splitlines() if l.strip()), "")
+    return f"{title[3:]} | {first[:100]}"
+
+
+def status_model(goals: Path) -> dict:
+    """One derivation of what is true right now. 21 section 5.1.
+
+    `gk status --json` used to dump four raw files and return before the parked
+    derivation the text path performs, so a parked goal reported `"state": null`
+    to a machine while printing the queue correctly to a human — the machine
+    surface was strictly less informative than the human one, and every feature
+    added below the early return was invisible by default. There is now one model
+    and two renderings of it; nothing may be computed in a renderer.
+    """
+    slug = active_info(goals)
+    parked = [{
+        "slug": s,
+        "needs": st.get("needs"),
+        "needs_human_at": st.get("needs_human_at"),
+        "rejection_count": st.get("rejection_count", 0),
+        "chain_step": st.get("chain_step"),
+        "last_judge_verdict": st.get("last_judge_verdict"),
+    } for s, st in _parked_goals(goals)]
+    state = load_state(goals, slug) if slug else None
+    goal = None
+    if slug:
+        st = state or {}
+        meta = contract_meta(goals, slug)
+        goal = {
+            "slug": slug,
+            "objective": meta.get("objective"),
+            "status": st.get("status"),
+            "rejection_count": st.get("rejection_count", 0),
+            "max_rejections": meta.get("max_rejections") or 5,
+            "started_at": st.get("started_at"),
+            "last_checkpoint_at": st.get("last_checkpoint_at"),
+            "last_validator_result": st.get("last_validator_result"),
+            "last_judge_verdict": st.get("last_judge_verdict"),
+            "last_judge_mode": st.get("last_judge_mode"),
+            "chain_step": st.get("chain_step"),
+            "last_log": last_log_line(goals, slug),
+        }
+    return {
+        "generated_at": now_iso(),
+        "gk_version": gk_version(),
+        "slug": slug,
+        "status": (state or {}).get("status") if slug else None,
+        "needs_human": bool(parked),
+        "parked": parked,
+        "goal": goal,
+        # The four raw files stay, verbatim and under their original keys, so a
+        # reader written against the old --json output keeps working.
+        "active": read_json(goals / "active.json"),
+        "state": state,
+        "chain": read_json(goals / "chain.json"),
+        "mission": read_mission(goals),
+    }
+
+
 def cmd_status(args) -> int:
     goals = find_goals_dir()
-    slug = active_info(goals)
-    chain = read_json(goals / "chain.json")
-    mission = read_mission(goals)
+    model = status_model(goals)
     if args.json:
-        payload = {
-            "active": read_json(goals / "active.json"),
-            "state": load_state(goals, slug) if slug else None,
-            "chain": chain,
-            "mission": mission,
-        }
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(model, indent=2))
         return 0
+    mission = model["mission"]
     if mission:
         print(f"Mission:     {mission.get('name')}  ({mission.get('status')}, "
               f"{len(mission.get('goals_completed', []))} goals completed)")
-    if not slug:
-        term = read_json(goals / "active.json") or {}
+    goal = model["goal"]
+    if not goal:
+        term = model["active"] or {}
         prev = term.get("previous_slug")
         extra = f" Last: {prev} ({term.get('ended_reason')})." if prev else ""
         print(f"No active goal.{extra} Run /goal-prep \"<rough idea>\" or "
               f"/goal \"<objective>\" to start one.")
-        _print_parked(goals)
+        _render_parked(model["parked"])
         return 0
-    state = load_state(goals, slug) or {}
-    meta, _, _ = load_contract(goals, slug)
-    max_rej = meta.get("max_rejections") or 5
-    log_path = goals / slug / "log.md"
-    last_log = "—"
-    if log_path.is_file():
-        _, blocks = split_log_blocks(log_path.read_text())
-        if blocks:
-            title, body = blocks[-1]
-            first = next((l for l in body.splitlines() if l.strip()), "")
-            last_log = f"{title[3:]} | {first[:100]}"
-    print(f"Goal:        {slug}")
-    print(f"Objective:   {meta.get('objective', '—')}")
-    print(f"Status:      {state.get('status', '?')}   "
-          f"Rejections: {state.get('rejection_count', 0)}/{max_rej}")
-    print(f"Started:     {state.get('started_at', '—')}")
-    print(f"Validator:   {state.get('last_validator_result')}")
-    print(f"Judge:       {state.get('last_judge_verdict')}")
-    print(f"Last log:    {last_log}")
+    chain = model["chain"]
+    print(f"Goal:        {goal['slug']}")
+    print(f"Objective:   {goal['objective'] or '—'}")
+    print(f"Status:      {goal['status'] or '?'}   "
+          f"Rejections: {goal['rejection_count']}/{goal['max_rejections']}")
+    print(f"Started:     {goal['started_at'] or '—'}")
+    print(f"Validator:   {goal['last_validator_result']}")
+    print(f"Judge:       {goal['last_judge_verdict']}")
+    print(f"Last log:    {goal['last_log']}")
     if chain and chain.get("status") in ("active", "waiting"):
         waiting = "  WAITING on a parked goal" if \
             chain.get("status") == "waiting" else ""
         print(f"Chain:       {chain['name']}  "
               f"[{chain['cursor']}/{len(chain['slugs'])} approved]{waiting}")
-    if state.get("status") == "needs_human":
+    if goal["status"] == "needs_human":
         print("\nNEEDS_HUMAN — see the latest 'judge rejected' block in "
-              f"{log_path} — fix the listed items, then /goal-resume or /goal-clear.")
-    _print_parked(goals, exclude=slug)
+              f"{goals / goal['slug'] / 'log.md'} — fix the listed items, "
+              f"then /goal-resume or /goal-clear.")
+    _render_parked([p for p in model["parked"] if p["slug"] != goal["slug"]])
     return 0
 
 
@@ -455,6 +863,20 @@ def _activate(goals: Path, slug: str, chain_name: Optional[str] = None,
     if dirty:
         body += f"\nPre-existing dirty paths at activation: {', '.join(dirty[:20])}"
     append_log(goals, slug, title, body)
+    emit_goal_event(
+        goals, slug, "goal.activated",
+        f"goal '{slug}' activated"
+        + (f" as chain step {chain_step}" if chain_step is not None else ""),
+        extra={
+            "from_status": None,
+            "to_status": "active",
+            "objective": meta.get("objective"),
+            "max_rejections": meta.get("max_rejections") or 5,
+            "judge_mode": meta.get("judge_mode") or "subagent",
+            "started_at_dirty_paths": dirty,
+            "chain_name": chain_name,
+        },
+        state=state)
 
 
 def cmd_activate(args) -> int:
@@ -515,6 +937,10 @@ def cmd_checkpoint(args) -> int:
     if state:
         state["last_checkpoint_at"] = now_iso()
         save_state(goals, args.slug, state)
+    emit_goal_event(goals, args.slug, "goal.checkpointed",
+                    f"checkpoint recorded for '{args.slug}'",
+                    extra={"message": msg.strip()[:EMIT_TEXT_CAP]},
+                    state=state)
     print("Checkpoint logged.")
     return 0
 
@@ -531,6 +957,13 @@ def cmd_validate(args) -> int:
     passed = result == "pass"
     append_log(goals, args.slug, f"validator {'passed' if passed else 'failed'}",
                "" if passed else result)
+    emit_goal_event(goals, args.slug, "goal.validated",
+                    f"validator {'passed' if passed else 'failed'} for "
+                    f"'{args.slug}'",
+                    extra={"result": result, "passed": passed,
+                           "command": (meta.get("validator") or {}).get("command"),
+                           "output_tail": tail(output)[:EMIT_TEXT_CAP]},
+                    state=state)
     print(f"VALIDATOR: {result}")
     t = tail(output)
     if t:
@@ -731,6 +1164,10 @@ def _complete_chain(goals: Path, chain: dict, final_slug: str) -> None:
         "slug": None, "ended_at": now_iso(), "ended_reason": "chain_completed",
         "previous_slug": final_slug, "previous_chain": chain["name"],
     })
+    emit_goal_event(goals, final_slug, "chain.completed",
+                    f"chain '{chain['name']}' completed at '{final_slug}'",
+                    extra={"ended_reason": "chain_completed",
+                           "final_slug": final_slug})
 
 
 def _advance_chain(goals: Path, chain: dict, approved_slug: str) -> str:
@@ -739,6 +1176,7 @@ def _advance_chain(goals: Path, chain: dict, approved_slug: str) -> str:
     Returns 'CHAIN_COMPLETE' or 'NEXT: <slug>'.
     """
     state = load_state(goals, approved_slug) or {}
+    prior_status = state.get("status")
     state["status"] = "done"
     save_state(goals, approved_slug, state)
     approvals = chain.setdefault("link_approvals", [])
@@ -746,6 +1184,11 @@ def _advance_chain(goals: Path, chain: dict, approved_slug: str) -> str:
         approvals.append({"slug": approved_slug, "approved_at": now_iso()})
     chain["cursor"] = chain.get("cursor", 0) + 1
     write_json(goals / "chain.json", chain)
+    emit_goal_event(goals, approved_slug, "chain.advanced",
+                    f"chain '{chain['name']}' advanced past '{approved_slug}'",
+                    extra={"from_status": prior_status, "to_status": "done",
+                           "approved_slug": approved_slug},
+                    state=state)
     slugs = chain["slugs"]
     if chain["cursor"] >= len(slugs):
         _complete_chain(goals, chain, approved_slug)
@@ -854,6 +1297,7 @@ def cmd_verdict(args) -> int:
         append_log(goals, slug, "judge approved", f"Reasons:\n{reasons}")
         if tok:
             _write_receipt(goals, slug, meta, state, tok, entry)
+        _emit_verdict(goals, slug, state, entry, reasons, "")
         chain = _chain_active_at_cursor(goals, slug)
         if chain:
             result = _advance_chain(goals, chain, slug)
@@ -867,6 +1311,12 @@ def cmd_verdict(args) -> int:
                 "slug": None, "ended_at": now_iso(), "ended_reason": "done",
                 "previous_slug": slug,
             })
+            emit_goal_event(goals, slug, "goal.completed",
+                            f"goal '{slug}' completed on judge approval",
+                            extra={"from_status": "active", "to_status": "done",
+                                   "ended_reason": "done",
+                                   "approved_at": state.get("approved_at")},
+                            state=state)
             print(f"APPROVED: {slug}")
             print("DONE")
         return 0
@@ -882,17 +1332,53 @@ def cmd_verdict(args) -> int:
                f"Reasons:\n{reasons}\n\nFix-list:\n{fix_list}\n\n"
                f"Rejection count: {n}/{max_rej}")
     if n >= max_rej:
+        _emit_verdict(goals, slug, state, entry, reasons, fix_list,
+                      max_rejections=max_rej)
         _park(goals, slug, state,
               f"review the judge's fix-list ({n}/{max_rej} rejections), then "
               f"`gk resume {slug} --reset-rejections` or `gk clear`",
-              "parked (max rejections)")
+              "parked (max rejections)",
+              # 06 section 10.1 precedence: `validation_failed` is more specific
+              # than `hard_dependency_broken` when the gate itself is what
+              # refused, and both outrank `state_stale`.
+              signal_type="validation_failed",
+              signal_reason=f"goal '{slug}' exhausted its rejection budget "
+                            f"({n}/{max_rej}) and is waiting for a person")
         print(f"REJECTED: {slug}  ({n}/{max_rej})")
         print("NEEDS_HUMAN")
     else:
         save_state(goals, slug, state)
+        _emit_verdict(goals, slug, state, entry, reasons, fix_list,
+                      max_rejections=max_rej)
         print(f"REJECTED: {slug}  ({n}/{max_rej})")
         print("RETRY")
     return 0
+
+
+def _emit_verdict(goals: Path, slug: str, state: dict, entry: dict,
+                  reasons: str, fix_list: str,
+                  max_rejections: Optional[int] = None) -> None:
+    """The judged event, carrying the receipt inline.
+
+    `cross_flow_relay.py` reads `receipt.json` out of the goal directory today;
+    the whole receipt travels here so it does not have to. It is the same object
+    `gk receipt` prints — minted by the CLI at the moment the token was
+    consumed, never typed by a caller.
+    """
+    outcome = "approved" if entry["verdict"] == "approve" else "rejected"
+    emit_goal_event(
+        goals, slug, "goal.judged", f"judge {outcome} '{slug}'",
+        extra={
+            "verdict": entry["verdict"],
+            "judge_mode": entry.get("mode"),
+            "token_id": entry.get("token_id"),
+            "legacy_verdict": bool(entry.get("legacy")),
+            "max_rejections": max_rejections,
+            "reasons": reasons[:EMIT_TEXT_CAP],
+            "fix_list": fix_list[:EMIT_TEXT_CAP] or None,
+            "receipt": read_json(goals / slug / "receipt.json"),
+        },
+        state=state)
 
 
 def cmd_receipt(args) -> int:
@@ -946,6 +1432,9 @@ def cmd_chain_start(args) -> int:
         "started_at": now_iso(), "completed_at": None,
         "source_file": str(src), "link_approvals": [],
     })
+    emit_goal_event(goals, slugs[0], "chain.started",
+                    f"chain '{name}' started with {len(slugs)} goals",
+                    extra={"chain_name": name, "source_file": str(src)})
     _activate(goals, slugs[0], chain_name=name, chain_step=1)
     print(f"Chain '{name}' started: {len(slugs)} goals.")
     print(f"NEXT: {slugs[0]}")
@@ -987,28 +1476,43 @@ def cmd_pause(args) -> int:
     save_state(goals, slug, state)
     append_log(goals, slug, "paused",
                "Paused by user. No further iterations until /goal-resume.")
+    emit_goal_event(goals, slug, "goal.paused",
+                    f"goal '{slug}' paused by user",
+                    extra={"from_status": "active", "to_status": "paused"},
+                    state=state)
     print(f"Paused goal '{slug}'. Resume with /goal-resume.")
     return 0
 
 
-def _park(goals: Path, slug: str, state: dict, needs: str, title: str) -> None:
+def _park(goals: Path, slug: str, state: dict, needs: str, title: str,
+          signal_type: str = "hard_dependency_broken",
+          signal_reason: Optional[str] = None) -> None:
     """needs_human parks the GOAL, never the agent.
 
     Record exactly what a person must provide, free the active slot so other
     goals can run, and put the goal's chain (if any) into 'waiting'. The goal
     sits in the parked queue (`gk status`) until a human unblocks it and work
     resumes with `gk resume <slug>`.
+
+    This is the moment 21 section 3 is about. Alongside the local writes it
+    raises the kernel condition that says a person is now the blocker — the
+    thing nothing outside gk could learn on 2026-08-30. Severity is `attention`
+    for both park paths: 06 section 9 sets severity from the required response
+    horizon, and gk knows of no deadline here, so it declines to manufacture one.
     """
+    prior_status = state.get("status")
     state["status"] = "needs_human"
     state["needs_human_at"] = now_iso()
     state["needs"] = needs
     save_state(goals, slug, state)
-    if active_info(goals) == slug:
+    freed_slot = active_info(goals) == slug
+    if freed_slot:
         write_json(goals / "active.json", {
             "slug": None, "ended_at": now_iso(), "ended_reason": "parked",
             "previous_slug": slug,
         })
     chain = read_json(goals / "chain.json")
+    chain_waiting = False
     if chain and chain.get("status") == "active":
         cursor = chain.get("cursor", 0)
         slugs = chain.get("slugs", [])
@@ -1016,10 +1520,25 @@ def _park(goals: Path, slug: str, state: dict, needs: str, title: str) -> None:
             chain["status"] = "waiting"
             chain["waiting_since"] = now_iso()
             write_json(goals / "chain.json", chain)
+            chain_waiting = True
     append_log(goals, slug, title,
                f"Needs a human: {needs}\n"
                f"The active slot is free — continue with other work. "
                f"Unblock, then `gk resume {slug}`.")
+    emit_goal_event(
+        goals, slug, "goal.parked", f"goal '{slug}' parked: {needs}",
+        extra={"from_status": prior_status, "to_status": "needs_human",
+               "needs": needs, "park_reason": title,
+               "freed_active_slot": freed_slot,
+               "chain_moved_to_waiting": chain_waiting},
+        state=state,
+        escalate={
+            "signal_type": signal_type,
+            "severity": "attention",
+            "reason": signal_reason
+            or f"goal '{slug}' is parked and cannot proceed without a person: "
+               f"{needs}",
+        })
 
 
 def _parked_goals(goals: Path) -> list:
@@ -1034,15 +1553,15 @@ def _parked_goals(goals: Path) -> list:
     return out
 
 
-def _print_parked(goals: Path, exclude: Optional[str] = None) -> None:
-    parked = [(s, st) for s, st in _parked_goals(goals) if s != exclude]
+def _render_parked(parked: list) -> None:
+    """Renderer only — the queue itself is derived once, in status_model()."""
     if not parked:
         return
     print("\nParked (needs a human — everything else may proceed):")
-    for s, st in parked:
-        print(f"  {s} — since {st.get('needs_human_at', '?')}")
-        print(f"    needs: {st.get('needs', 'see the goal log')}")
-        print(f"    unblock, then: gk resume {s}")
+    for p in parked:
+        print(f"  {p['slug']} — since {p.get('needs_human_at') or '?'}")
+        print(f"    needs: {p.get('needs') or 'see the goal log'}")
+        print(f"    unblock, then: gk resume {p['slug']}")
 
 
 def cmd_park(args) -> int:
@@ -1099,6 +1618,7 @@ def cmd_resume(args) -> int:
         state["rejection_count"] = 0
         note += " Rejection counter reset."
     save_state(goals, slug, state)
+    chain_rearmed = False
     if active != slug:
         active_data = {"slug": slug, "activated_at": now_iso()}
         chain = read_json(goals / "chain.json")
@@ -1110,8 +1630,19 @@ def cmd_resume(args) -> int:
                 chain.pop("waiting_since", None)
                 write_json(goals / "chain.json", chain)
                 active_data["chain"] = chain["name"]
+                chain_rearmed = True
         write_json(goals / "active.json", active_data)
     append_log(goals, slug, "resumed", note)
+    emit_goal_event(
+        goals, slug, "goal.resumed", f"goal '{slug}' resumed by user",
+        extra={"from_status": status, "to_status": "active",
+               "reset_rejections": bool(args.reset_rejections),
+               "chain_rearmed": chain_rearmed},
+        state=state,
+        # The person showed up. A live condition that is not stood down is worse
+        # than none: the next reader cannot tell a real blocker from a stale one.
+        stand_down=(f"goal '{slug}' resumed — the human-gated blocker is cleared"
+                    if status == "needs_human" else None))
     print(f"Resumed goal '{slug}'.")
     return 0
 
@@ -1143,6 +1674,19 @@ def cmd_clear(args) -> int:
     archive = goals / "_archive"
     archive.mkdir(exist_ok=True)
     dest = archive / f"{slug}-{stamp}"
+    # Emit before the move: afterwards the goal dir is gone and the payload
+    # builder would report an empty state for a goal that had one.
+    if chain and chain.get("status") == "aborted":
+        emit_goal_event(goals, slug, "chain.aborted",
+                        f"chain '{chain['name']}' aborted by clear of '{slug}'",
+                        extra={"chain_name": chain["name"]}, state=state)
+    emit_goal_event(
+        goals, slug, "goal.cleared", f"goal '{slug}' cleared and archived",
+        extra={"from_status": state.get("status"), "to_status": "cleared",
+               "ended_reason": "cleared", "archived_to": str(dest)},
+        state=state,
+        stand_down=(f"goal '{slug}' cleared — the human-gated blocker no longer "
+                    f"applies" if state.get("status") == "needs_human" else None))
     shutil.move(str(goals / slug), str(dest))
     write_json(goals / "active.json", terminal)
     print(f"Cleared goal '{slug}'. Archived to {dest}.")
@@ -1199,7 +1743,8 @@ def cmd_doctor(args) -> int:
                     f"'{cur_slug}'",
                     lambda c=chain, s=cur_slug: write_json(
                         goals / "active.json",
-                        {"slug": s, "activated_at": now_iso(), "chain": c["name"]})))
+                        {"slug": s, "activated_at": now_iso(), "chain": c["name"]}),
+                    cur_slug))
             # Symptom D: missing link_approval for prior approved links
             approvals = {a.get("slug") for a in chain.get("link_approvals", [])}
             for prior in slugs[:cursor]:
@@ -1211,21 +1756,33 @@ def cmd_doctor(args) -> int:
                         lambda c=chain, p=prior, w=when: (
                             c.setdefault("link_approvals", []).append(
                                 {"slug": p, "approved_at": w}),
-                            write_json(goals / "chain.json", c))))
+                            write_json(goals / "chain.json", c)),
+                        prior))
     slug = active_info(goals)
     if slug and load_state(goals, slug) is None:
         problems.append((f"active.json points at '{slug}' but state.json missing",
                          lambda: write_json(goals / "active.json", {
                              "slug": None, "ended_at": now_iso(),
-                             "ended_reason": "cleared", "previous_slug": slug})))
+                             "ended_reason": "cleared", "previous_slug": slug}),
+                         slug))
     if not problems:
         print("OK — no inconsistencies detected.")
         return 0
-    for desc, repair in problems:
+    for entry in problems:
+        desc, repair = entry[0], entry[1]
+        subject = entry[2] if len(entry) > 2 else None
         print(f"PROBLEM: {desc}")
         if args.fix:
             repair()
             print("  fixed.")
+            # A repair is a state change like any other. Some repairs route
+            # through _activate/_advance_chain and emit their own event; the
+            # rest would otherwise be the one class of gk write no one outside
+            # could see.
+            if subject:
+                emit_goal_event(goals, subject, "goal.repaired",
+                                f"gk doctor repaired: {desc}",
+                                extra={"problem": desc})
     if not args.fix:
         print("\nRun `gk doctor --fix` to repair.")
         return 1
@@ -1353,6 +1910,9 @@ def cmd_mission_init(args) -> int:
     write_mission(goals, mission)
     append_mission_log(goals, "mission initialized",
                        f"Mission: {mission['name']}")
+    emit_mission_event(goals, mission, "mission.initialized",
+                       f"mission '{mission['name']}' initialized",
+                       extra={"from_status": None, "to_status": "active"})
     print(f"Mission '{mission['name']}' initialized.")
     return 0
 
@@ -1555,6 +2115,25 @@ def cmd_mission_verdict(args) -> int:
 
     verdicts.append(entry)
     write_mission(goals, mission)
+    emit_mission_event(
+        goals, mission, "mission.verdict",
+        f"supervisor verdict '{args.decision}' on mission "
+        f"'{mission.get('name')}'",
+        extra={"verdict": args.decision, "prior_slug": prior_slug,
+               "to_status": mission.get("status"),
+               "reasoning": reasoning[:EMIT_TEXT_CAP],
+               "next_objective": entry.get("next_objective"),
+               "escalation": entry.get("escalation")},
+        # Same signal type as a parked goal, deliberately: the condition is the
+        # same shape — work that cannot proceed without a named person — and gk
+        # publishing two vocabularies for one condition would make it harder to
+        # read, not more precise.
+        escalate=({
+            "signal_type": "hard_dependency_broken",
+            "severity": "attention",
+            "reason": f"mission '{mission.get('name')}' escalated to a person: "
+                      f"{entry.get('escalation')}",
+        } if args.decision == "escalate" else None))
 
     if args.decision == "done":
         snapshot = (f"# Mission completed: {mission.get('name')}\n\n"
@@ -1593,6 +2172,12 @@ def cmd_mission_resume(args) -> int:
     append_mission_log(goals, "escalation resolved",
                        "Resumed by user."
                        + (f"\nResolution: {note}" if note else ""))
+    emit_mission_event(
+        goals, mission, "mission.resumed",
+        f"mission '{mission.get('name')}' resumed after escalation",
+        extra={"from_status": "escalated", "to_status": "active",
+               "resolution": note or None},
+        stand_down=f"mission '{mission.get('name')}' escalation resolved")
     print(f"Mission '{mission.get('name')}' resumed (escalation resolved). "
           "Re-run the supervisor: gk mission-brief → spawn → gk mission-verdict.")
     return 0
